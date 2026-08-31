@@ -1,141 +1,118 @@
+"""
+Settings Dialog for NanoPiViewer.
+Fully in English with presets and fine-tuning options.
+"""
+
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import config
 
-class SettingsDialog:
+class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, on_save_callback=None):
-        self.parent = parent
+        super().__init__(parent)
+        self.title("Settings - NanoPiViewer")
+        self.geometry("450x480")
+        self.resizable(False, False)
+        self.configure(bg="#2d2d2d")
+        self.transient(parent)
+        self.grab_set()
+
         self.on_save_callback = on_save_callback
-        self.config_data = config.load_config()
+        self.cfg = config.load_config()
 
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Settings - NanoPi Screen Viewer")
-        self.dialog.geometry("460x420")
-        self.dialog.resizable(False, False)
-        self.dialog.configure(bg="#2d2d2d")
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+        self._build_ui()
 
-        self._setup_ui()
+    def _build_ui(self):
+        lbl_style = {"bg": "#2d2d2d", "fg": "white", "font": ("Segoe UI", 9)}
+        entry_style = {"bg": "#3c3f41", "fg": "white", "insertbackground": "white", "relief": tk.FLAT}
 
-    def _setup_ui(self):
-        lbl_style = {"bg": "#2d2d2d", "fg": "#ffffff", "font": ("Segoe UI", 9)}
-        entry_style = {"bg": "#3c3f41", "fg": "#ffffff", "insertbackground": "white", "relief": tk.FLAT}
+        # Preset Frame
+        preset_frame = tk.LabelFrame(self, text=" Quick Network Presets ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
+        preset_frame.pack(fill=tk.X, padx=15, pady=8)
 
-        container = tk.Frame(self.dialog, bg="#2d2d2d", padx=20, pady=15)
-        container.pack(fill=tk.BOTH, expand=True)
+        btn_preset_style = {"bg": "#3c3f41", "fg": "white", "relief": tk.FLAT, "padx": 6, "pady": 2, "cursor": "hand2"}
+        tk.Button(preset_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=4)
+        tk.Button(preset_frame, text="🔌 Ethernet (169.254.42.120)", command=lambda: self._set_ip("169.254.42.120"), **btn_preset_style).pack(side=tk.LEFT, padx=4)
 
-        # Title
-        tk.Label(
-            container, text="⚙ Connection & Display Settings",
-            bg="#2d2d2d", fg="#4CAF50", font=("Segoe UI", 12, "bold")
-        ).pack(anchor=tk.W, pady=(0, 15))
+        # Connection Settings Frame
+        conn_frame = tk.LabelFrame(self, text=" Connection Settings ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
+        conn_frame.pack(fill=tk.X, padx=15, pady=4)
 
-        # Device IP
-        f_ip = tk.Frame(container, bg="#2d2d2d")
-        f_ip.pack(fill=tk.X, pady=4)
-        tk.Label(f_ip, text="Device IP Address:", width=20, anchor=tk.W, **lbl_style).pack(side=tk.LEFT)
-        self.ip_entry = tk.Entry(f_ip, **entry_style)
-        self.ip_entry.insert(0, self.config_data.get("device_ip", "192.168.1.113"))
-        self.ip_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(conn_frame, text="Device IP:", **lbl_style).grid(row=0, column=0, sticky="w", pady=3)
+        self.ip_entry = tk.Entry(conn_frame, **entry_style)
+        self.ip_entry.insert(0, str(self.cfg.get("device_ip", "192.168.1.113")))
+        self.ip_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=3)
 
-        # ADB Port
-        f_adb = tk.Frame(container, bg="#2d2d2d")
-        f_adb.pack(fill=tk.X, pady=4)
-        tk.Label(f_adb, text="ADB Port:", width=20, anchor=tk.W, **lbl_style).pack(side=tk.LEFT)
-        self.adb_port_entry = tk.Entry(f_adb, **entry_style)
-        self.adb_port_entry.insert(0, str(self.config_data.get("adb_port", 5555)))
-        self.adb_port_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(conn_frame, text="ADB Port:", **lbl_style).grid(row=1, column=0, sticky="w", pady=3)
+        self.adb_port_entry = tk.Entry(conn_frame, **entry_style)
+        self.adb_port_entry.insert(0, str(self.cfg.get("adb_port", 5555)))
+        self.adb_port_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=3)
 
-        # Minicap Port
-        f_mc = tk.Frame(container, bg="#2d2d2d")
-        f_mc.pack(fill=tk.X, pady=4)
-        tk.Label(f_mc, text="Minicap Port:", width=20, anchor=tk.W, **lbl_style).pack(side=tk.LEFT)
-        self.mc_port_entry = tk.Entry(f_mc, **entry_style)
-        self.mc_port_entry.insert(0, str(self.config_data.get("minicap_port", 1717)))
-        self.mc_port_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(conn_frame, text="Minicap Port:", **lbl_style).grid(row=2, column=0, sticky="w", pady=3)
+        self.minicap_port_entry = tk.Entry(conn_frame, **entry_style)
+        self.minicap_port_entry.insert(0, str(self.cfg.get("minicap_port", 1717)))
+        self.minicap_port_entry.grid(row=2, column=1, sticky="ew", padx=10, pady=3)
 
-        # Native Resolution
-        f_res = tk.Frame(container, bg="#2d2d2d")
-        f_res.pack(fill=tk.X, pady=4)
-        tk.Label(f_res, text="Native Resolution:", width=20, anchor=tk.W, **lbl_style).pack(side=tk.LEFT)
-        self.res_entry = tk.Entry(f_res, **entry_style)
-        self.res_entry.insert(0, self.config_data.get("native_resolution", "1280x720"))
-        self.res_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        conn_frame.columnconfigure(1, weight=1)
 
-        # Stream Resolution
-        f_sres = tk.Frame(container, bg="#2d2d2d")
-        f_sres.pack(fill=tk.X, pady=4)
-        tk.Label(f_sres, text="Stream Resolution:", width=20, anchor=tk.W, **lbl_style).pack(side=tk.LEFT)
-        self.sres_entry = tk.Entry(f_sres, **entry_style)
-        self.sres_entry.insert(0, self.config_data.get("stream_resolution", "1280x720"))
-        self.sres_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Display & Stream Frame
+        disp_frame = tk.LabelFrame(self, text=" Stream & Performance ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
+        disp_frame.pack(fill=tk.X, padx=15, pady=4)
 
-        # Keep awake checkbox
-        self.awake_var = tk.BooleanVar(value=self.config_data.get("keep_screen_on", True))
-        cb_awake = tk.Checkbutton(
-            container, text="Prevent screen sleep (Stay Awake)",
-            variable=self.awake_var, bg="#2d2d2d", fg="white", selectcolor="#3c3f41",
-            activebackground="#2d2d2d", activeforeground="white"
-        )
-        cb_awake.pack(anchor=tk.W, pady=(10, 4))
+        tk.Label(disp_frame, text="Native Resolution:", **lbl_style).grid(row=0, column=0, sticky="w", pady=3)
+        self.native_res_entry = tk.Entry(disp_frame, **entry_style)
+        self.native_res_entry.insert(0, str(self.cfg.get("native_resolution", "1280x720")))
+        self.native_res_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=3)
 
-        # Auto connect checkbox
-        self.auto_var = tk.BooleanVar(value=self.config_data.get("auto_connect", True))
-        cb_auto = tk.Checkbutton(
-            container, text="Auto-connect on startup",
-            variable=self.auto_var, bg="#2d2d2d", fg="white", selectcolor="#3c3f41",
-            activebackground="#2d2d2d", activeforeground="white"
-        )
-        cb_auto.pack(anchor=tk.W, pady=2)
+        tk.Label(disp_frame, text="Stream Resolution:", **lbl_style).grid(row=1, column=0, sticky="w", pady=3)
+        self.stream_res_entry = tk.Entry(disp_frame, **entry_style)
+        self.stream_res_entry.insert(0, str(self.cfg.get("stream_resolution", "1280x720")))
+        self.stream_res_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=3)
+
+        tk.Label(disp_frame, text="JPEG Quality (10-100):", **lbl_style).grid(row=2, column=0, sticky="w", pady=3)
+        self.quality_entry = tk.Entry(disp_frame, **entry_style)
+        self.quality_entry.insert(0, str(self.cfg.get("jpeg_quality", 60)))
+        self.quality_entry.grid(row=2, column=1, sticky="ew", padx=10, pady=3)
+
+        disp_frame.columnconfigure(1, weight=1)
+
+        # Behavior Frame
+        behave_frame = tk.LabelFrame(self, text=" Behavior ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
+        behave_frame.pack(fill=tk.X, padx=15, pady=4)
+
+        self.stayon_var = tk.BooleanVar(value=self.cfg.get("keep_screen_on", True))
+        tk.Checkbutton(
+            behave_frame, text="Keep Device Screen Awake (svc power stayon)",
+            variable=self.stayon_var, bg="#2d2d2d", fg="white",
+            selectcolor="#3c3f41", activebackground="#2d2d2d", activeforeground="white"
+        ).pack(anchor="w", pady=2)
 
         # Buttons
-        btn_box = tk.Frame(container, bg="#2d2d2d", pady=15)
-        btn_box.pack(side=tk.BOTTOM, fill=tk.X)
+        btn_frame = tk.Frame(self, bg="#2d2d2d")
+        btn_frame.pack(fill=tk.X, padx=15, pady=12)
 
-        btn_style = {"relief": tk.FLAT, "padx": 15, "pady": 4, "cursor": "hand2"}
+        tk.Button(btn_frame, text="Save & Reconnect", bg="#4CAF50", fg="white", activebackground="#45a049", activeforeground="white", relief=tk.FLAT, padx=12, pady=4, command=self._save_and_close, cursor="hand2").pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="Cancel", bg="#555555", fg="white", activebackground="#666666", activeforeground="white", relief=tk.FLAT, padx=10, pady=4, command=self.destroy, cursor="hand2").pack(side=tk.RIGHT)
 
-        tk.Button(
-            btn_box, text="Save & Apply", bg="#4CAF50", fg="white",
-            activebackground="#45a049", activeforeground="white",
-            command=self._save, **btn_style
-        ).pack(side=tk.RIGHT, padx=5)
+    def _set_ip(self, ip_addr):
+        self.ip_entry.delete(0, tk.END)
+        self.ip_entry.insert(0, ip_addr)
 
-        tk.Button(
-            btn_box, text="Cancel", bg="#555555", fg="white",
-            activebackground="#666666", activeforeground="white",
-            command=self.dialog.destroy, **btn_style
-        ).pack(side=tk.RIGHT, padx=5)
-
-    def _save(self):
-        ip = self.ip_entry.get().strip()
-        if not ip:
-            messagebox.showerror("Error", "Please enter a valid IP address.")
-            return
-
+    def _save_and_close(self):
         try:
-            adb_port = int(self.adb_port_entry.get().strip())
-            mc_port = int(self.mc_port_entry.get().strip())
-        except ValueError:
-            messagebox.showerror("Error", "Port numbers must be numeric.")
-            return
+            self.cfg["device_ip"] = self.ip_entry.get().strip()
+            self.cfg["adb_port"] = int(self.adb_port_entry.get().strip())
+            self.cfg["minicap_port"] = int(self.minicap_port_entry.get().strip())
+            self.cfg["native_resolution"] = self.native_res_entry.get().strip()
+            self.cfg["stream_resolution"] = self.stream_res_entry.get().strip()
+            self.cfg["jpeg_quality"] = max(10, min(100, int(self.quality_entry.get().strip())))
+            self.cfg["keep_screen_on"] = self.stayon_var.get()
 
-        new_config = {
-            "device_ip": ip,
-            "adb_port": adb_port,
-            "minicap_port": mc_port,
-            "native_resolution": self.res_entry.get().strip() or "1280x720",
-            "stream_resolution": self.sres_entry.get().strip() or "1280x720",
-            "keep_screen_on": self.awake_var.get(),
-            "auto_connect": self.auto_var.get(),
-            "window_width": self.config_data.get("window_width", 1020),
-            "window_height": self.config_data.get("window_height", 660),
-            "fps_limit": self.config_data.get("fps_limit", 60)
-        }
+            config.save_config(self.cfg)
 
-        if config.save_config(new_config):
-            self.dialog.destroy()
             if self.on_save_callback:
-                self.on_save_callback(new_config)
-        else:
-            messagebox.showerror("Error", "Failed to save configuration.")
+                self.on_save_callback(self.cfg)
+
+            self.destroy()
+        except ValueError as ex:
+            messagebox.showerror("Validation Error", f"Please verify your inputs:\n{ex}")
