@@ -606,7 +606,42 @@ def acquire_single_instance_mutex():
     return True
 
 
+def cleanup_orphaned_temp_dirs():
+    """Clean up abandoned PyInstaller _MEI extraction folders from previous crashed runs."""
+    try:
+        import tempfile
+        import shutil
+        temp_dir = tempfile.gettempdir()
+        current_mei = getattr(sys, "_MEIPASS", None)
+        cleaned_count = 0
+        cleaned_bytes = 0
+
+        for item in os.listdir(temp_dir):
+            if item.startswith("_MEI"):
+                full_path = os.path.join(temp_dir, item)
+                if os.path.isdir(full_path) and full_path != current_mei:
+                    try:
+                        for root_dir, _, files in os.walk(full_path):
+                            for f in files:
+                                try:
+                                    cleaned_bytes += os.path.getsize(os.path.join(root_dir, f))
+                                except Exception:
+                                    pass
+                        shutil.rmtree(full_path, ignore_errors=True)
+                        cleaned_count += 1
+                    except Exception:
+                        pass
+
+        if cleaned_count > 0:
+            logger.info(f"[Temp Cleaner] Purged {cleaned_count} orphaned PyInstaller folders ({cleaned_bytes / (1024*1024):.1f} MB freed).")
+    except Exception as ex:
+        logger.debug(f"[Temp Cleaner Notice]: {ex}")
+
+
 def main():
+    # Purge any leftover PyInstaller temp directories from earlier crashed sessions
+    cleanup_orphaned_temp_dirs()
+
     if not acquire_single_instance_mutex():
         logger.warning("Another instance of NanoPiViewer is already running. Exiting.")
         root = tk.Tk()
