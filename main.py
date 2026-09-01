@@ -441,7 +441,7 @@ class NanoPiViewerApp:
                     subprocess.run(
                         [self.adb_path, "-s", self.device_serial, "shell", cmd_line],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=1.5,
+                        timeout=4.0,
                         creationflags=CREATE_NO_WINDOW
                     )
                 self.input_queue.task_done()
