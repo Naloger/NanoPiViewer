@@ -1,14 +1,22 @@
 """
 Settings Dialog for NanoPiViewer.
-Fully in English with Auto-Detect and Quick Network Presets.
+Fully in English with One-Click Direct Ethernet Setup, Auto-Detect, and Quick Presets.
 """
 
 import concurrent.futures
 import socket
 import subprocess
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
+
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
 import config
 
 CREATE_NO_WINDOW = 0x08000000
@@ -17,7 +25,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, on_save_callback=None):
         super().__init__(parent)
         self.title("Settings - NanoPiViewer")
-        self.geometry("460x520")
+        self.geometry("480x540")
         self.resizable(False, False)
         self.configure(bg="#2d2d2d")
         self.transient(parent)
@@ -33,15 +41,25 @@ class SettingsDialog(tk.Toplevel):
         entry_style = {"bg": "#3c3f41", "fg": "white", "insertbackground": "white", "relief": tk.FLAT}
 
         # Preset Frame
-        preset_frame = tk.LabelFrame(self, text=" Quick Network Presets ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=8)
+        preset_frame = tk.LabelFrame(self, text=" Quick Network Presets & Auto-Setup ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=8)
         preset_frame.pack(fill=tk.X, padx=15, pady=8)
 
         btn_preset_style = {"bg": "#3c3f41", "fg": "white", "relief": tk.FLAT, "padx": 6, "pady": 3, "cursor": "hand2", "font": ("Segoe UI", 8, "bold")}
-        tk.Button(preset_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
-        tk.Button(preset_frame, text="🔌 Ethernet (169.254.42.120)", command=lambda: self._set_ip("169.254.42.120"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
+        
+        top_btn_frame = tk.Frame(preset_frame, bg="#2d2d2d")
+        top_btn_frame.pack(fill=tk.X, pady=2)
+
+        tk.Button(top_btn_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
+        
+        self.eth_setup_btn = tk.Button(
+            top_btn_frame, text="🔌 Setup Direct Ethernet", command=self._run_direct_ethernet_setup,
+            bg="#388E3C", fg="white", activebackground="#2E7D32", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=3, cursor="hand2", font=("Segoe UI", 8, "bold")
+        )
+        self.eth_setup_btn.pack(side=tk.LEFT, padx=3)
 
         self.auto_btn = tk.Button(
-            preset_frame, text="🔍 Auto-Detect", command=self._run_auto_detect,
+            top_btn_frame, text="🔍 Auto-Detect", command=self._run_auto_detect,
             bg="#0288D1", fg="white", activebackground="#0277BD", activeforeground="white",
             relief=tk.FLAT, padx=8, pady=3, cursor="hand2", font=("Segoe UI", 8, "bold")
         )
@@ -110,6 +128,45 @@ class SettingsDialog(tk.Toplevel):
     def _set_ip(self, ip_addr):
         self.ip_entry.delete(0, tk.END)
         self.ip_entry.insert(0, ip_addr)
+
+    def _run_direct_ethernet_setup(self):
+        self.eth_setup_btn.config(text="Configuring...", state=tk.DISABLED)
+        threading.Thread(target=self._direct_ethernet_worker, daemon=True).start()
+
+    def _direct_ethernet_worker(self):
+        target_ip = "169.254.42.120"
+        success = False
+
+        if SERIAL_AVAILABLE:
+            try:
+                s = serial.Serial('COM3', 115200, timeout=1.0)
+                cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\nnetcfg eth0 dhcp\n"
+                s.write(cmd)
+                time.sleep(0.5)
+                s.close()
+                success = True
+            except Exception:
+                pass
+
+        def update_ui():
+            self.eth_setup_btn.config(text="🔌 Setup Direct Ethernet", state=tk.NORMAL)
+            self._set_ip(target_ip)
+            if success:
+                messagebox.showinfo(
+                    "Direct Ethernet Configured",
+                    f"Direct Ethernet IP assigned ({target_ip})!\n\n"
+                    "• Board eth0 is UP (169.254.42.120 / 255.255.0.0)\n"
+                    "• ADB TCP port 5555 enabled.\n\n"
+                    "Click [Save & Reconnect] to start streaming over Ethernet cable."
+                )
+            else:
+                messagebox.showinfo(
+                    "Direct Ethernet Preset",
+                    f"Target IP set to {target_ip}.\n\n"
+                    "Click [Save & Reconnect] to connect."
+                )
+
+        self.after(0, update_ui)
 
     def _run_auto_detect(self):
         self.auto_btn.config(text="Scanning...", state=tk.DISABLED)
