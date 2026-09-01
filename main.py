@@ -291,10 +291,13 @@ class NanoPiViewerApp:
                 self._set_status("Initializing stream...", fg="#4CAF50")
 
                 # Step 1: Clean up any stale minicap process on Android gracefully (SIGTERM -15)
-                subprocess.run(
-                    [self.adb_path, "-s", self.device_serial, "shell", "pkill -15 minicap 2>/dev/null || killall -15 minicap 2>/dev/null"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
-                )
+                try:
+                    subprocess.run(
+                        [self.adb_path, "-s", self.device_serial, "shell", "pkill -15 minicap 2>/dev/null || killall -15 minicap 2>/dev/null"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW
+                    )
+                except Exception:
+                    pass
                 time.sleep(0.3)  # Allow SurfaceFlinger graphic buffers to unlock cleanly
 
                 # Step 2: Forward port with unique abstract socket name
