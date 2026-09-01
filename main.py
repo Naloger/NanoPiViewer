@@ -282,7 +282,7 @@ class NanoPiViewerApp:
                                 "• Screen mirroring will automatically start when the device responds."
                             )
                             self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
-                        time.sleep(1.5)
+                        time.sleep(2.5)
                         continue
 
                 if self.restart_requested:
@@ -295,6 +295,7 @@ class NanoPiViewerApp:
                     [self.adb_path, "-s", self.device_serial, "shell", "pkill -15 minicap 2>/dev/null || killall -15 minicap 2>/dev/null"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
                 )
+                time.sleep(0.3)  # Allow SurfaceFlinger graphic buffers to unlock cleanly
 
                 # Step 2: Forward port with unique abstract socket name
                 sock_name = f"mc_{int(time.time()) % 100000}"
