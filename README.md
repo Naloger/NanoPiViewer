@@ -1,6 +1,6 @@
 # 📱 NanoPiViewer
 
-[![GitHub Release](https://img.shields.io/github/v/release/Naloger/NanoPiViewer?include_prereleases&style=flat-square)](https://github.com/Naloger/NanoPiViewer/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/Naloger/NanoPiViewer?style=flat-square)](https://github.com/Naloger/NanoPiViewer/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=flat-square)](https://github.com/Naloger/NanoPiViewer)
 [![Android](https://img.shields.io/badge/target-Android%205.1%20%7C%20API%2022-brightgreen.svg?style=flat-square)](https://github.com/Naloger/NanoPiViewer)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
