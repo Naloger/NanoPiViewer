@@ -1,0 +1,13 @@
+{
+  "device_ip": "192.168.1.113",
+  "adb_port": 5555,
+  "minicap_port": 1717,
+  "native_resolution": "1280x720",
+  "stream_resolution": "1280x720",
+  "jpeg_quality": 60,
+  "auto_connect": true,
+  "keep_screen_on": true,
+  "fps_limit": 60,
+  "window_width": 1020,
+  "window_height": 660
+}
