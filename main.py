@@ -120,7 +120,8 @@ class NanoPiViewerApp:
         self.fps = 0.0
         self.has_active_stream = False
 
-        self.input_pipe = None
+        self.current_stream_sock = None
+        self.current_minicap_proc = None
 
         self._setup_ui()
         self._start_threads()
@@ -228,6 +229,25 @@ class NanoPiViewerApp:
 
     def _start_capture_thread(self):
         self.stream_stop_event.set()
+        
+        # Instantly unblock any active socket or process
+        if self.current_stream_sock:
+            try: self.current_stream_sock.close()
+            except Exception: pass
+            self.current_stream_sock = None
+
+        if self.current_minicap_proc:
+            try: self.current_minicap_proc.terminate()
+            except Exception: pass
+            self.current_minicap_proc = None
+
+        if self.capture_thread and self.capture_thread.is_alive() and threading.current_thread() != self.capture_thread:
+            try:
+                self.capture_thread.join(timeout=0.3)
+            except Exception:
+                pass
+
+        self.stream_stop_event.clear()
         self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
         self.capture_thread.start()
 
@@ -319,152 +339,158 @@ class NanoPiViewerApp:
         return bytes(data)
 
     def _logged_stream_worker(self):
-        if not STREAM_LOCK.acquire(blocking=False):
-            logger.info("StreamWorker thread already active. Exiting duplicate.")
-            return
-
-        try:
-            self.stream_stop_event.clear()
-            logger.info(f"Stream worker started. Target: {self.device_serial}, port: {self.minicap_port}")
-            
-            while self.running and not self.stream_stop_event.is_set():
-                s = None
-                minicap_proc = None
-                try:
-                    # Step 0: Ensure Device is Connected & Awake
-                    if not self._is_device_ready():
-                        self._set_status(f"Searching for {self.device_serial}...", fg="#FFA726")
-                        if not self._connect_adb():
-                            if not self.has_active_stream:
-                                offline_msg = (
-                                    f"💤 NanoPi 2 is Asleep or Offline ({self.device_serial})\n\n"
-                                    "• Press the physical POWER button on the board to wake Wi-Fi.\n"
-                                    "• Or click [⚡ Power / Wake] in the top toolbar to wake via Serial COM3.\n"
-                                    "• Stream will automatically start as soon as the device is awake."
-                                )
-                                self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
-                            time.sleep(1.5)
-                            continue
-
-                    self._set_status("Initializing stream...", fg="#4CAF50")
-
-                    # Step 1: Forward port with unique abstract socket name
-                    sock_name = f"mc_{int(time.time()) % 100000}"
-                    t0 = time.time()
-                    logger.info(f"[Step 1] Forwarding port tcp:{self.minicap_port} -> localabstract:{sock_name}...")
-                    subprocess.run(
-                        [self.adb_path, "-s", self.device_serial, "forward", f"tcp:{self.minicap_port}", f"localabstract:{sock_name}"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW
-                    )
-                    logger.info(f"[Step 1 Done] ADB forward took {time.time()-t0:.3f}s")
-
-                    # Step 2: Spawn minicap with unique socket name
-                    nat_res = self.config.get("native_resolution", "1280x720")
-                    str_res = self.config.get("stream_resolution", "1280x720")
-                    quality = self.config.get("jpeg_quality", 60)
-
-                    minicap_cmd = [
-                        self.adb_path, "-s", self.device_serial, "shell",
-                        f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P {nat_res}@{str_res}/0 -Q {quality} -S"
-                    ]
-                    logger.info(f"[Step 2] Spawning minicap (Quality={quality}, Socket={sock_name}): {' '.join(minicap_cmd)}")
-                    minicap_proc = subprocess.Popen(
-                        minicap_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        creationflags=CREATE_NO_WINDOW
-                    )
-
-                    # Give minicap 0.4s to initialize abstract socket
-                    time.sleep(0.4)
-
-                    # Wake screen
-                    self._dispatch_command("input keyevent 82")
-                    self._dispatch_command("svc power stayon true")
-
-                    # Step 3: Socket Handshake
-                    logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-                    s.settimeout(2.5)
-
-                    s.connect(("127.0.0.1", self.minicap_port))
-                    banner = self._recv_all(s, 24)
-
-                    if not banner or len(banner) < 24:
-                        logger.warning(f"[Step 3 Failed] Incomplete banner. Retrying...")
-                        s.close()
-                        if minicap_proc:
-                            try: minicap_proc.terminate()
-                            except Exception: pass
-                        time.sleep(1.0)
+        logger.info(f"Stream worker started. Target: {self.device_serial}, port: {self.minicap_port}")
+        
+        while self.running and not self.stream_stop_event.is_set():
+            s = None
+            minicap_proc = None
+            try:
+                # Step 0: Ensure Device is Connected & Awake
+                if not self._is_device_ready():
+                    self._set_status(f"Searching for {self.device_serial}...", fg="#FFA726")
+                    if not self._connect_adb():
+                        if not self.has_active_stream:
+                            offline_msg = (
+                                f"💤 NanoPi 2 is Asleep or Offline ({self.device_serial})\n\n"
+                                "• Press the physical POWER button on the board to wake Wi-Fi.\n"
+                                "• Or click [⚡ Power / Wake] in the top toolbar to wake via Serial COM3.\n"
+                                "• Stream will automatically start as soon as the device is awake."
+                            )
+                            self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
+                        time.sleep(1.5)
                         continue
 
-                    rw = struct.unpack("<I", banner[6:10])[0]
-                    rh = struct.unpack("<I", banner[10:14])[0]
-                    vw = struct.unpack("<I", banner[14:18])[0]
-                    vh = struct.unpack("<I", banner[18:22])[0]
-                    logger.info(f"[Banner Parsed] Real={rw}x{rh}, Virtual={vw}x{vh}")
+                if self.stream_stop_event.is_set():
+                    break
 
-                    self.native_width = rw
-                    self.native_height = rh
-                    self.target_w = vw
-                    self.target_h = vh
+                self._set_status("Initializing stream...", fg="#4CAF50")
 
-                    s.settimeout(10.0)
-                    logger.info("[Step 4] Entering continuous streaming loop...")
+                # Step 1: Forward port with unique abstract socket name
+                sock_name = f"mc_{int(time.time()) % 100000}"
+                t0 = time.time()
+                logger.info(f"[Step 1] Forwarding port tcp:{self.minicap_port} -> localabstract:{sock_name}...")
+                subprocess.run(
+                    [self.adb_path, "-s", self.device_serial, "forward", f"tcp:{self.minicap_port}", f"localabstract:{sock_name}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW
+                )
+                logger.info(f"[Step 1 Done] ADB forward took {time.time()-t0:.3f}s")
 
-                    first_frame = True
-                    while self.running and not self.stream_stop_event.is_set():
-                        t_frame_start = time.time()
-                        size_raw = self._recv_all(s, 4)
-                        if not size_raw or len(size_raw) < 4:
-                            logger.warning("Frame stream ended or timed out. Reconnecting...")
-                            break
+                if self.stream_stop_event.is_set():
+                    break
 
-                        frame_size = struct.unpack("<I", size_raw)[0]
-                        if frame_size <= 0 or frame_size > 5000000:
-                            break
+                # Step 2: Spawn minicap with unique socket name
+                nat_res = self.config.get("native_resolution", "1280x720")
+                str_res = self.config.get("stream_resolution", "1280x720")
+                quality = self.config.get("jpeg_quality", 60)
 
-                        frame_data = self._recv_all(s, frame_size)
-                        if not frame_data or len(frame_data) < frame_size:
-                            break
+                minicap_cmd = [
+                    self.adb_path, "-s", self.device_serial, "shell",
+                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P {nat_res}@{str_res}/0 -Q {quality} -S"
+                ]
+                logger.info(f"[Step 2] Spawning minicap (Quality={quality}, Socket={sock_name}): {' '.join(minicap_cmd)}")
+                minicap_proc = subprocess.Popen(
+                    minicap_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=CREATE_NO_WINDOW
+                )
+                self.current_minicap_proc = minicap_proc
 
-                        t_recv = time.time()
-                        img = Image.open(BytesIO(frame_data))
+                # Give minicap 0.4s to initialize abstract socket
+                time.sleep(0.4)
 
-                        if first_frame:
-                            logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
-                            first_frame = False
-                            self.has_active_stream = True
+                if self.stream_stop_event.is_set():
+                    break
 
-                        try:
-                            old_item = self.frame_queue.get_nowait()
-                            if old_item and old_item[0]:
-                                old_item[0].close()
-                        except queue.Empty:
-                            pass
+                # Wake screen
+                self._dispatch_command("input keyevent 82")
+                self._dispatch_command("svc power stayon true")
 
-                        self.frame_queue.put((img, len(frame_data), t_recv - t_frame_start))
+                # Step 3: Socket Handshake
+                logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                s.settimeout(2.5)
 
+                self.current_stream_sock = s
+                s.connect(("127.0.0.1", self.minicap_port))
+                banner = self._recv_all(s, 24)
+
+                if not banner or len(banner) < 24:
+                    logger.warning(f"[Step 3 Failed] Incomplete banner. Retrying...")
                     s.close()
                     if minicap_proc:
                         try: minicap_proc.terminate()
                         except Exception: pass
-
-                except Exception as e:
-                    logger.exception(f"Stream worker exception: {e}")
-                    self.has_active_stream = False
-                    if s:
-                        try: s.close()
-                        except Exception: pass
-                    if minicap_proc:
-                        try: minicap_proc.terminate()
-                        except Exception: pass
                     time.sleep(1.0)
-        finally:
-            STREAM_LOCK.release()
+                    continue
+
+                rw = struct.unpack("<I", banner[6:10])[0]
+                rh = struct.unpack("<I", banner[10:14])[0]
+                vw = struct.unpack("<I", banner[14:18])[0]
+                vh = struct.unpack("<I", banner[18:22])[0]
+                logger.info(f"[Banner Parsed] Real={rw}x{rh}, Virtual={vw}x{vh}")
+
+                self.native_width = rw
+                self.native_height = rh
+                self.target_w = vw
+                self.target_h = vh
+
+                s.settimeout(10.0)
+                logger.info("[Step 4] Entering continuous streaming loop...")
+
+                first_frame = True
+                while self.running and not self.stream_stop_event.is_set():
+                    t_frame_start = time.time()
+                    size_raw = self._recv_all(s, 4)
+                    if not size_raw or len(size_raw) < 4:
+                        logger.warning("Frame stream ended or timed out. Reconnecting...")
+                        break
+
+                    frame_size = struct.unpack("<I", size_raw)[0]
+                    if frame_size <= 0 or frame_size > 5000000:
+                        break
+
+                    frame_data = self._recv_all(s, frame_size)
+                    if not frame_data or len(frame_data) < frame_size:
+                        break
+
+                    t_recv = time.time()
+                    img = Image.open(BytesIO(frame_data))
+
+                    if first_frame:
+                        logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
+                        first_frame = False
+                        self.has_active_stream = True
+
+                    try:
+                        old_item = self.frame_queue.get_nowait()
+                        if old_item and old_item[0]:
+                            old_item[0].close()
+                    except queue.Empty:
+                        pass
+
+                    self.frame_queue.put((img, len(frame_data), t_recv - t_frame_start))
+
+                s.close()
+                if minicap_proc:
+                    try: minicap_proc.terminate()
+                    except Exception: pass
+
+            except Exception as e:
+                logger.exception(f"Stream worker exception: {e}")
+                self.has_active_stream = False
+                if s:
+                    try: s.close()
+                    except Exception: pass
+                if minicap_proc:
+                    try: minicap_proc.terminate()
+                    except Exception: pass
+                time.sleep(1.0)
+            finally:
+                self.current_stream_sock = None
+                self.current_minicap_proc = None
 
     def _persistent_input_worker(self):
         logger.info("Starting persistent ADB input worker...")
