@@ -1,17 +1,23 @@
 """
 Settings Dialog for NanoPiViewer.
-Fully in English with presets and fine-tuning options.
+Fully in English with Auto-Detect and Quick Network Presets.
 """
 
+import concurrent.futures
+import socket
+import subprocess
+import threading
 import tkinter as tk
 from tkinter import messagebox
 import config
+
+CREATE_NO_WINDOW = 0x08000000
 
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, on_save_callback=None):
         super().__init__(parent)
         self.title("Settings - NanoPiViewer")
-        self.geometry("450x480")
+        self.geometry("460x520")
         self.resizable(False, False)
         self.configure(bg="#2d2d2d")
         self.transient(parent)
@@ -27,12 +33,19 @@ class SettingsDialog(tk.Toplevel):
         entry_style = {"bg": "#3c3f41", "fg": "white", "insertbackground": "white", "relief": tk.FLAT}
 
         # Preset Frame
-        preset_frame = tk.LabelFrame(self, text=" Quick Network Presets ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
+        preset_frame = tk.LabelFrame(self, text=" Quick Network Presets ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=8)
         preset_frame.pack(fill=tk.X, padx=15, pady=8)
 
-        btn_preset_style = {"bg": "#3c3f41", "fg": "white", "relief": tk.FLAT, "padx": 6, "pady": 2, "cursor": "hand2"}
-        tk.Button(preset_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=4)
-        tk.Button(preset_frame, text="🔌 Ethernet (169.254.42.120)", command=lambda: self._set_ip("169.254.42.120"), **btn_preset_style).pack(side=tk.LEFT, padx=4)
+        btn_preset_style = {"bg": "#3c3f41", "fg": "white", "relief": tk.FLAT, "padx": 6, "pady": 3, "cursor": "hand2", "font": ("Segoe UI", 8, "bold")}
+        tk.Button(preset_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
+        tk.Button(preset_frame, text="🔌 Ethernet (169.254.42.120)", command=lambda: self._set_ip("169.254.42.120"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
+
+        self.auto_btn = tk.Button(
+            preset_frame, text="🔍 Auto-Detect", command=self._run_auto_detect,
+            bg="#0288D1", fg="white", activebackground="#0277BD", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=3, cursor="hand2", font=("Segoe UI", 8, "bold")
+        )
+        self.auto_btn.pack(side=tk.LEFT, padx=3)
 
         # Connection Settings Frame
         conn_frame = tk.LabelFrame(self, text=" Connection Settings ", bg="#2d2d2d", fg="#4CAF50", padx=10, pady=6)
@@ -91,12 +104,60 @@ class SettingsDialog(tk.Toplevel):
         btn_frame = tk.Frame(self, bg="#2d2d2d")
         btn_frame.pack(fill=tk.X, padx=15, pady=12)
 
-        tk.Button(btn_frame, text="Save & Reconnect", bg="#4CAF50", fg="white", activebackground="#45a049", activeforeground="white", relief=tk.FLAT, padx=12, pady=4, command=self._save_and_close, cursor="hand2").pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="Save & Reconnect", bg="#4CAF50", fg="white", activebackground="#45a049", activeforeground="white", relief=tk.FLAT, padx=12, pady=4, command=self._save_and_close, cursor="hand2", font=("Segoe UI", 9, "bold")).pack(side=tk.RIGHT, padx=5)
         tk.Button(btn_frame, text="Cancel", bg="#555555", fg="white", activebackground="#666666", activeforeground="white", relief=tk.FLAT, padx=10, pady=4, command=self.destroy, cursor="hand2").pack(side=tk.RIGHT)
 
     def _set_ip(self, ip_addr):
         self.ip_entry.delete(0, tk.END)
         self.ip_entry.insert(0, ip_addr)
+
+    def _run_auto_detect(self):
+        self.auto_btn.config(text="Scanning...", state=tk.DISABLED)
+        threading.Thread(target=self._auto_detect_worker, daemon=True).start()
+
+    def _auto_detect_worker(self):
+        detected_ip = None
+
+        # 1. Check existing ADB attached devices
+        try:
+            p = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5, creationflags=CREATE_NO_WINDOW)
+            for line in p.stdout.splitlines():
+                if "\tdevice" in line:
+                    dev_id = line.split("\t")[0].strip()
+                    if ":" in dev_id:
+                        detected_ip = dev_id.split(":")[0]
+                        break
+        except Exception:
+            pass
+
+        # 2. Parallel Fast Socket Scan
+        if not detected_ip:
+            candidates = ["192.168.1.113", "169.254.42.120"] + [f"192.168.1.{i}" for i in range(100, 140) if f"192.168.1.{i}" != "192.168.1.113"]
+            
+            def check_ip(ip):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.35)
+                res = s.connect_ex((ip, 5555))
+                s.close()
+                return ip if res == 0 else None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+                results = list(executor.map(check_ip, candidates))
+                for ip in results:
+                    if ip:
+                        detected_ip = ip
+                        break
+
+        # Update UI in main thread
+        def update_ui():
+            self.auto_btn.config(text="🔍 Auto-Detect", state=tk.NORMAL)
+            if detected_ip:
+                self._set_ip(detected_ip)
+                messagebox.showinfo("Auto-Detect Success", f"Found active NanoPi 2 at:\n{detected_ip}")
+            else:
+                messagebox.showwarning("Auto-Detect", "No active NanoPi 2 found on port 5555.\n\nTip: Press the physical POWER button on the board or select a preset.")
+
+        self.after(0, update_ui)
 
     def _save_and_close(self):
         try:
