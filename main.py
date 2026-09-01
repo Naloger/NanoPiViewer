@@ -264,8 +264,22 @@ class NanoPiViewerApp:
             logger.debug(f"[Self-Heal] COM3 notice: {e}")
 
     def _connect_adb(self):
-        if self._is_device_ready():
-            return True
+        # 1. If device is already online and authorized, we are ready
+        try:
+            p = subprocess.run(
+                [self.adb_path, "devices"],
+                capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
+            )
+            for line in p.stdout.splitlines():
+                if self.device_serial in line:
+                    if "\tdevice" in line:
+                        return True
+                    elif "\toffline" in line:
+                        logger.info(f"[Offline Reset] Device {self.device_serial} is in offline state. Disconnecting...")
+                        subprocess.run([self.adb_path, "disconnect", self.device_serial], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5, creationflags=CREATE_NO_WINDOW)
+                        break
+        except Exception:
+            pass
 
         logger.info(f"[Connect] Running: adb connect {self.device_serial}...")
         t0 = time.time()
