@@ -290,9 +290,9 @@ class NanoPiViewerApp:
 
                 self._set_status("Initializing stream...", fg="#4CAF50")
 
-                # Step 1: Clean up any stale minicap process on Android
+                # Step 1: Clean up any stale minicap process on Android gracefully (SIGTERM -15)
                 subprocess.run(
-                    [self.adb_path, "-s", self.device_serial, "shell", "pkill -9 minicap 2>/dev/null || killall -9 minicap 2>/dev/null"],
+                    [self.adb_path, "-s", self.device_serial, "shell", "pkill -15 minicap 2>/dev/null || killall -15 minicap 2>/dev/null"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
                 )
 
@@ -329,10 +329,6 @@ class NanoPiViewerApp:
 
                 if self.restart_requested:
                     continue
-
-                # Wake screen gently
-                self._dispatch_command("input keyevent 224")
-                self._dispatch_command("input keyevent 82")
 
                 # Step 4: Socket Handshake
                 logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
@@ -502,13 +498,9 @@ class NanoPiViewerApp:
         self.root.after(16, self._update_loop)
 
     def _wake_screen_safely(self):
-        logger.info("Executing safe screen wake sequence (KEYCODE_WAKEUP + MENU + SWIPE)...")
-        # KEYCODE_WAKEUP = 224 (Turns screen ON only, never off!)
+        logger.info("Executing safe screen wake (KEYCODE_WAKEUP 224)...")
+        # KEYCODE_WAKEUP = 224 (Turns screen ON gently without JVM process storm)
         self._dispatch_command("input keyevent 224")
-        # KEYCODE_MENU = 82 (Dismiss lock screen)
-        self._dispatch_command("input keyevent 82")
-        # Swipe up
-        self._dispatch_command("input swipe 640 600 640 100 200")
 
     def _on_mouse_down(self, event):
         self.drag_start = (event.x, event.y, time.time())
