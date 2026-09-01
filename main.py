@@ -330,26 +330,37 @@ class NanoPiViewerApp:
                 )
                 self.current_minicap_proc = minicap_proc
 
-                # Allow minicap 0.4s to initialize abstract socket
-                time.sleep(0.4)
-
-                if self.restart_requested:
-                    continue
-
-                # Step 4: Socket Handshake
+                # Step 4: Socket Handshake with retry loop (waiting up to 2.5s for minicap abstract socket)
                 logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-                s.settimeout(2.5)
-
-                self.current_stream_sock = s
-                s.connect(("127.0.0.1", self.minicap_port))
-                banner = self._recv_all(s, 24)
+                s = None
+                banner = None
+                
+                for attempt in range(8):
+                    if self.restart_requested or not self.running:
+                        break
+                    try:
+                        temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        temp_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                        temp_sock.settimeout(0.8)
+                        temp_sock.connect(("127.0.0.1", self.minicap_port))
+                        temp_banner = self._recv_all(temp_sock, 24)
+                        if temp_banner and len(temp_banner) == 24:
+                            s = temp_sock
+                            banner = temp_banner
+                            self.current_stream_sock = s
+                            break
+                        else:
+                            temp_sock.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
 
                 if not banner or len(banner) < 24:
-                    logger.warning(f"[Step 3 Failed] Incomplete banner. Retrying...")
-                    s.close()
+                    logger.warning(f"[Step 3 Failed] Incomplete banner after retries. Retrying minicap spawn...")
+                    if s:
+                        try: s.close()
+                        except Exception: pass
                     if minicap_proc:
                         try: minicap_proc.terminate()
                         except Exception: pass
