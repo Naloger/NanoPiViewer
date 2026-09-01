@@ -1,6 +1,6 @@
 """
 NanoPi 2 - Portable Standalone Android Screen Viewer
-Production-grade, zero-leak, thread-safe auto-recovering stream engine.
+Production-grade, crash-proof, zero-leak stream engine.
 """
 
 import ctypes
@@ -30,7 +30,6 @@ from ui_settings import SettingsDialog
 
 CREATE_NO_WINDOW = 0x08000000
 COM_LOCK = threading.Lock()
-STREAM_LOCK = threading.Lock()
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -122,6 +121,9 @@ class NanoPiViewerApp:
 
         self.current_stream_sock = None
         self.current_minicap_proc = None
+        self.last_serial_heal_time = 0.0
+
+        self.input_pipe = None
 
         self._setup_ui()
         self._start_threads()
@@ -141,7 +143,7 @@ class NanoPiViewerApp:
         tk.Button(self.toolbar, text="⌂ Home", command=lambda: self.send_key(3), **btn_style).pack(side=tk.LEFT, padx=3)
         tk.Button(self.toolbar, text="▢ Apps", command=lambda: self.send_key(187), **btn_style).pack(side=tk.LEFT, padx=3)
         tk.Button(self.toolbar, text="☰ Menu", command=lambda: self.send_key(82), **btn_style).pack(side=tk.LEFT, padx=3)
-        tk.Button(self.toolbar, text="⚡ Power / Wake", command=self._wake_and_unlock, **btn_style).pack(side=tk.LEFT, padx=3)
+        tk.Button(self.toolbar, text="⚡ Wake Screen", command=self._wake_screen_safely, **btn_style).pack(side=tk.LEFT, padx=3)
         tk.Button(self.toolbar, text="🔊 Vol +", command=lambda: self.send_key(24), **btn_style).pack(side=tk.LEFT, padx=3)
         tk.Button(self.toolbar, text="🔉 Vol -", command=lambda: self.send_key(25), **btn_style).pack(side=tk.LEFT, padx=3)
 
@@ -159,7 +161,7 @@ class NanoPiViewerApp:
         offline_msg = (
             f"🔍 Connecting to NanoPi 2 ({self.device_serial})...\n\n"
             "• If the board is asleep, press the physical POWER button on the board.\n"
-            "• Or click [⚡ Power / Wake] in the toolbar to wake via Serial COM3.\n"
+            "• Or click [⚡ Wake Screen] in the toolbar.\n"
             "• Screen mirroring will automatically start when the device responds."
         )
         self.display_label = tk.Label(
@@ -217,13 +219,12 @@ class NanoPiViewerApp:
         self._start_capture_thread()
 
     def _keepalive_worker(self):
-        """Sends stay-awake policy every 25 seconds when connected to prevent Wi-Fi sleep."""
+        """Periodically keeps Android awake without spawning heavy Dalvik processes."""
         while self.running:
-            time.sleep(25)
+            time.sleep(30)
             if self.has_active_stream:
                 try:
                     self._dispatch_command("svc power stayon true")
-                    self._dispatch_command("settings put global wifi_sleep_policy 2")
                 except Exception:
                     pass
 
@@ -271,30 +272,10 @@ class NanoPiViewerApp:
             pass
         return False
 
-    def _try_serial_self_heal(self):
-        """Thread-safe serial port configuration of IP and TCP ADB 5555 on the board."""
-        if not SERIAL_AVAILABLE:
-            return
-        if not COM_LOCK.acquire(blocking=False):
-            return
-        try:
-            logger.info("[Self-Heal] Probing COM3 to configure IP and enable TCP ADB on board...")
-            s = serial.Serial('COM3', 115200, timeout=1.0)
-            cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\ninput keyevent 82\nsvc power stayon true\n"
-            s.write(cmd)
-            time.sleep(0.4)
-            s.close()
-            logger.info("[Self-Heal Done] Sent full interface & ADB TCP 5555 command via COM3.")
-        except Exception as e:
-            logger.debug(f"[Self-Heal] COM3 notice: {e}")
-        finally:
-            COM_LOCK.release()
-
     def _connect_adb(self):
         if self._is_device_ready():
             return True
 
-        # 1. First clean connect attempt
         logger.info(f"[Connect] Running: adb connect {self.device_serial}...")
         try:
             p = subprocess.run(
@@ -304,24 +285,6 @@ class NanoPiViewerApp:
             logger.info(f"[Connect Result]: {p.stdout.strip()} {p.stderr.strip()}")
         except Exception as ex:
             logger.warning(f"[Connect Timeout/Notice]: {ex}")
-
-        if self._is_device_ready():
-            return True
-
-        # 2. Check if device is in offline/stale state or connection was refused
-        logger.info(f"[Self-Heal] Triggering serial port recovery...")
-        self._try_serial_self_heal()
-        time.sleep(0.4)
-
-        try:
-            subprocess.run([self.adb_path, "disconnect", self.device_serial], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW)
-            p = subprocess.run(
-                [self.adb_path, "connect", self.device_serial],
-                capture_output=True, text=True, timeout=2.5, creationflags=CREATE_NO_WINDOW
-            )
-            logger.info(f"[Connect Retry Result]: {p.stdout.strip()}")
-        except Exception as ex:
-            logger.warning(f"[Connect Retry Warning]: {ex}")
 
         return self._is_device_ready()
 
@@ -353,7 +316,7 @@ class NanoPiViewerApp:
                             offline_msg = (
                                 f"💤 NanoPi 2 is Asleep or Offline ({self.device_serial})\n\n"
                                 "• Press the physical POWER button on the board to wake Wi-Fi.\n"
-                                "• Or click [⚡ Power / Wake] in the top toolbar to wake via Serial COM3.\n"
+                                "• Or click [⚡ Wake Screen] in the top toolbar.\n"
                                 "• Stream will automatically start as soon as the device is awake."
                             )
                             self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
@@ -402,7 +365,8 @@ class NanoPiViewerApp:
                 if self.stream_stop_event.is_set():
                     break
 
-                # Wake screen
+                # Wake screen gently (KEYCODE_WAKEUP = 224 + KEYCODE_MENU = 82)
+                self._dispatch_command("input keyevent 224")
                 self._dispatch_command("input keyevent 82")
                 self._dispatch_command("svc power stayon true")
 
@@ -597,22 +561,30 @@ class NanoPiViewerApp:
 
         self.root.after(16, self._update_loop)
 
-    def _wake_and_unlock(self):
-        logger.info("Sending wake and unlock sequence via pipe and serial...")
-        self._dispatch_command("input keyevent 26")
+    def _wake_screen_safely(self):
+        """Safely wakes the screen and unlocks without toggling power or restarting ADB daemons."""
+        logger.info("Executing safe screen wake sequence (KEYCODE_WAKEUP + MENU + SWIPE)...")
+        # KEYCODE_WAKEUP = 224 (Turns screen ON only, never off!)
+        self._dispatch_command("input keyevent 224")
+        # KEYCODE_MENU = 82 (Dismiss lock screen)
         self._dispatch_command("input keyevent 82")
+        # Swipe up
         self._dispatch_command("input swipe 640 600 640 100 200")
         self._dispatch_command("svc power stayon true")
 
-        if SERIAL_AVAILABLE and COM_LOCK.acquire(blocking=False):
+        # Send non-destructive serial pulse ONLY if cooldown has passed
+        now = time.time()
+        if SERIAL_AVAILABLE and (now - self.last_serial_heal_time > 8.0) and COM_LOCK.acquire(blocking=False):
             try:
+                self.last_serial_heal_time = now
                 s = serial.Serial('COM3', 115200, timeout=0.5)
-                s.write(b"\nsu\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\ninput keyevent 82\nsvc power stayon true\n")
+                # Only wake and keep alive, never kill adbd in wake handler!
+                s.write(b"\nsu\ninput keyevent 224\ninput keyevent 82\nsvc power stayon true\n")
                 time.sleep(0.1)
                 s.close()
-                logger.info("Serial wake pulse sent on COM3.")
-            except Exception:
-                pass
+                logger.info("Safe serial wake pulse sent on COM3.")
+            except Exception as e:
+                logger.debug(f"Serial wake note: {e}")
             finally:
                 COM_LOCK.release()
 
