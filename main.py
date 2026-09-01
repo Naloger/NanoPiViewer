@@ -250,63 +250,53 @@ class NanoPiViewerApp:
         return False
 
     def _try_serial_self_heal(self):
-        """If COM3 serial is available, automatically enable TCP ADB port 5555 on the board."""
+        """If COM3 serial is available, configure eth0 and enable TCP ADB port 5555 on the board."""
         if not SERIAL_AVAILABLE:
             return
         try:
-            logger.info("[Self-Heal] Probing COM3 to enable TCP ADB on board...")
+            logger.info("[Self-Heal] Probing COM3 to configure IP and enable TCP ADB on board...")
             s = serial.Serial('COM3', 115200, timeout=1.0)
-            s.write(b"\nsu\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\ninput keyevent 82\nsvc power stayon true\n")
+            cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\ninput keyevent 82\nsvc power stayon true\n"
+            s.write(cmd)
             time.sleep(0.4)
             s.close()
-            logger.info("[Self-Heal Done] Sent TCP 5555 enable command via COM3.")
+            logger.info("[Self-Heal Done] Sent full interface & ADB TCP 5555 command via COM3.")
         except Exception as e:
             logger.debug(f"[Self-Heal] COM3 notice: {e}")
 
     def _connect_adb(self):
-        # 1. If device is already online and authorized, we are ready
-        try:
-            p = subprocess.run(
-                [self.adb_path, "devices"],
-                capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
-            )
-            for line in p.stdout.splitlines():
-                if self.device_serial in line:
-                    if "\tdevice" in line:
-                        return True
-                    elif "\toffline" in line:
-                        logger.info(f"[Offline Reset] Device {self.device_serial} is in offline state. Disconnecting...")
-                        subprocess.run([self.adb_path, "disconnect", self.device_serial], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5, creationflags=CREATE_NO_WINDOW)
-                        break
-        except Exception:
-            pass
+        if self._is_device_ready():
+            return True
 
+        # 1. First clean connect attempt
         logger.info(f"[Connect] Running: adb connect {self.device_serial}...")
-        t0 = time.time()
         try:
             p = subprocess.run(
                 [self.adb_path, "connect", self.device_serial],
-                capture_output=True, text=True, timeout=3.5, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=3.0, creationflags=CREATE_NO_WINDOW
             )
-            logger.info(f"[Connect Result] ({time.time()-t0:.3f}s): {p.stdout.strip()} {p.stderr.strip()}")
+            logger.info(f"[Connect Result]: {p.stdout.strip()} {p.stderr.strip()}")
         except Exception as ex:
             logger.warning(f"[Connect Timeout/Notice]: {ex}")
 
         if self._is_device_ready():
             return True
 
-        # Attempt self-heal via COM3 if first connect failed
+        # 2. Check if device is in offline/stale state or connection was refused
+        logger.info(f"[Self-Heal] Triggering serial port recovery & ADB server restart...")
         self._try_serial_self_heal()
-        time.sleep(0.3)
+        time.sleep(0.5)
 
         try:
+            subprocess.run([self.adb_path, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5, creationflags=CREATE_NO_WINDOW)
+            subprocess.run([self.adb_path, "start-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW)
             p = subprocess.run(
                 [self.adb_path, "connect", self.device_serial],
-                capture_output=True, text=True, timeout=2.5, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=3.0, creationflags=CREATE_NO_WINDOW
             )
-            logger.info(f"[Connect Retry Result]: {p.stdout.strip()}")
-        except Exception:
-            pass
+            logger.info(f"[Connect After Restart]: {p.stdout.strip()}")
+        except Exception as ex:
+            logger.warning(f"[Connect Restart Warning]: {ex}")
 
         return self._is_device_ready()
 
