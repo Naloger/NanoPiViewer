@@ -29,7 +29,6 @@ import config
 from ui_settings import SettingsDialog
 
 CREATE_NO_WINDOW = 0x08000000
-COM_LOCK = threading.Lock()
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -105,12 +104,11 @@ class NanoPiViewerApp:
         self.target_h = 720
 
         self.frame_queue = queue.Queue(maxsize=1)
-        self.input_queue = queue.Queue(maxsize=50)
+        self.input_queue = queue.Queue(maxsize=30)
         self.running = True
         self.stream_stop_event = threading.Event()
         self.capture_thread = None
         self.input_thread = None
-        self.keepalive_thread = None
         
         self.drag_start = None
         self.frame_count = 0
@@ -121,9 +119,7 @@ class NanoPiViewerApp:
 
         self.current_stream_sock = None
         self.current_minicap_proc = None
-        self.last_serial_heal_time = 0.0
-
-        self.input_pipe = None
+        self.thread_lock = threading.Lock()
 
         self._setup_ui()
         self._start_threads()
@@ -161,7 +157,7 @@ class NanoPiViewerApp:
         offline_msg = (
             f"🔍 Connecting to NanoPi 2 ({self.device_serial})...\n\n"
             "• If the board is asleep, press the physical POWER button on the board.\n"
-            "• Or click [⚡ Wake Screen] in the toolbar.\n"
+            "• Or click [⚡ Wake Screen] in the top toolbar.\n"
             "• Screen mirroring will automatically start when the device responds."
         )
         self.display_label = tk.Label(
@@ -210,53 +206,41 @@ class NanoPiViewerApp:
 
     def _start_threads(self):
         logger.info("Starting background threads...")
-        self.input_thread = threading.Thread(target=self._persistent_input_worker, daemon=True, name="InputWorker")
+        self.input_thread = threading.Thread(target=self._input_worker, daemon=True, name="InputWorker")
         self.input_thread.start()
-
-        self.keepalive_thread = threading.Thread(target=self._keepalive_worker, daemon=True, name="KeepAliveWorker")
-        self.keepalive_thread.start()
 
         self._start_capture_thread()
 
-    def _keepalive_worker(self):
-        """Periodically keeps Android awake without spawning heavy Dalvik processes."""
-        while self.running:
-            time.sleep(30)
-            if self.has_active_stream:
+    def _start_capture_thread(self):
+        with self.thread_lock:
+            self.stream_stop_event.set()
+            
+            # Instantly unblock any active socket or process
+            if self.current_stream_sock:
+                try: self.current_stream_sock.close()
+                except Exception: pass
+                self.current_stream_sock = None
+
+            if self.current_minicap_proc:
+                try: self.current_minicap_proc.terminate()
+                except Exception: pass
+                self.current_minicap_proc = None
+
+            if self.capture_thread and self.capture_thread.is_alive() and threading.current_thread() != self.capture_thread:
                 try:
-                    self._dispatch_command("svc power stayon true")
+                    self.capture_thread.join(timeout=0.3)
                 except Exception:
                     pass
 
-    def _start_capture_thread(self):
-        self.stream_stop_event.set()
-        
-        # Instantly unblock any active socket or process
-        if self.current_stream_sock:
-            try: self.current_stream_sock.close()
-            except Exception: pass
-            self.current_stream_sock = None
-
-        if self.current_minicap_proc:
-            try: self.current_minicap_proc.terminate()
-            except Exception: pass
-            self.current_minicap_proc = None
-
-        if self.capture_thread and self.capture_thread.is_alive() and threading.current_thread() != self.capture_thread:
-            try:
-                self.capture_thread.join(timeout=0.3)
-            except Exception:
-                pass
-
-        self.stream_stop_event.clear()
-        self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
-        self.capture_thread.start()
+            self.stream_stop_event.clear()
+            self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
+            self.capture_thread.start()
 
     def _is_device_ready(self):
         try:
             p = subprocess.run(
                 [self.adb_path, "devices"],
-                capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=1.5, creationflags=CREATE_NO_WINDOW
             )
             for line in p.stdout.splitlines():
                 if self.device_serial in line and "\tdevice" in line:
@@ -280,7 +264,7 @@ class NanoPiViewerApp:
         try:
             p = subprocess.run(
                 [self.adb_path, "connect", self.device_serial],
-                capture_output=True, text=True, timeout=2.5, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
             )
             logger.info(f"[Connect Result]: {p.stdout.strip()} {p.stderr.strip()}")
         except Exception as ex:
@@ -368,7 +352,6 @@ class NanoPiViewerApp:
                 # Wake screen gently (KEYCODE_WAKEUP = 224 + KEYCODE_MENU = 82)
                 self._dispatch_command("input keyevent 224")
                 self._dispatch_command("input keyevent 82")
-                self._dispatch_command("svc power stayon true")
 
                 # Step 3: Socket Handshake
                 logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
@@ -456,48 +439,23 @@ class NanoPiViewerApp:
                 self.current_stream_sock = None
                 self.current_minicap_proc = None
 
-    def _persistent_input_worker(self):
-        logger.info("Starting persistent ADB input worker...")
+    def _input_worker(self):
+        """Safe input worker dispatching one-shot lightweight commands."""
+        logger.info("Starting safe ADB input worker...")
         
         while self.running:
-            if not self._is_device_ready():
-                time.sleep(1.0)
-                continue
-
-            pipe = None
             try:
-                pipe = subprocess.Popen(
-                    [self.adb_path, "-s", self.device_serial, "shell"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW
-                )
-                self.input_pipe = pipe
-
-                while self.running and pipe.poll() is None:
-                    try:
-                        cmd_line = self.input_queue.get(timeout=0.5)
-                        if pipe.stdin and not pipe.stdin.closed:
-                            pipe.stdin.write(f"{cmd_line}\n".encode("utf-8"))
-                            pipe.stdin.flush()
-                        self.input_queue.task_done()
-                    except queue.Empty:
-                        continue
-                    except Exception as ex:
-                        logger.debug(f"Input pipe write notice: {ex}")
-                        break
-
+                cmd_line = self.input_queue.get(timeout=0.5)
+                if self.has_active_stream or self._is_device_ready():
+                    subprocess.run(
+                        [self.adb_path, "-s", self.device_serial, "shell", cmd_line],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
+                    )
+                self.input_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception as e:
-                logger.debug(f"Input pipe exception: {e}")
-            finally:
-                if pipe:
-                    try:
-                        if pipe.stdin: pipe.stdin.close()
-                        pipe.terminate()
-                    except Exception: pass
-                self.input_pipe = None
-                time.sleep(0.5)
+                logger.debug(f"Input dispatch notice: {e}")
 
     def _dispatch_command(self, cmd_str):
         try:
@@ -562,7 +520,7 @@ class NanoPiViewerApp:
         self.root.after(16, self._update_loop)
 
     def _wake_screen_safely(self):
-        """Safely wakes the screen and unlocks without toggling power or restarting ADB daemons."""
+        """Safely wakes the screen and unlocks without touching DTR/RTS reset or killing daemons."""
         logger.info("Executing safe screen wake sequence (KEYCODE_WAKEUP + MENU + SWIPE)...")
         # KEYCODE_WAKEUP = 224 (Turns screen ON only, never off!)
         self._dispatch_command("input keyevent 224")
@@ -570,23 +528,6 @@ class NanoPiViewerApp:
         self._dispatch_command("input keyevent 82")
         # Swipe up
         self._dispatch_command("input swipe 640 600 640 100 200")
-        self._dispatch_command("svc power stayon true")
-
-        # Send non-destructive serial pulse ONLY if cooldown has passed
-        now = time.time()
-        if SERIAL_AVAILABLE and (now - self.last_serial_heal_time > 8.0) and COM_LOCK.acquire(blocking=False):
-            try:
-                self.last_serial_heal_time = now
-                s = serial.Serial('COM3', 115200, timeout=0.5)
-                # Only wake and keep alive, never kill adbd in wake handler!
-                s.write(b"\nsu\ninput keyevent 224\ninput keyevent 82\nsvc power stayon true\n")
-                time.sleep(0.1)
-                s.close()
-                logger.info("Safe serial wake pulse sent on COM3.")
-            except Exception as e:
-                logger.debug(f"Serial wake note: {e}")
-            finally:
-                COM_LOCK.release()
 
     def _on_mouse_down(self, event):
         self.drag_start = (event.x, event.y, time.time())
@@ -643,10 +584,11 @@ class NanoPiViewerApp:
         logger.info("Application closing...")
         self.running = False
         self.stream_stop_event.set()
-        if self.input_pipe:
-            try:
-                if self.input_pipe.stdin: self.input_pipe.stdin.close()
-                self.input_pipe.terminate()
+        if self.current_stream_sock:
+            try: self.current_stream_sock.close()
+            except Exception: pass
+        if self.current_minicap_proc:
+            try: self.current_minicap_proc.terminate()
             except Exception: pass
         self.root.destroy()
 
