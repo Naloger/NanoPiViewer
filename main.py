@@ -1,6 +1,6 @@
 """
 NanoPi 2 - Portable Standalone Android Screen Viewer
-Production-grade, zero-leak, auto-recovering stream engine with smart sleep detection & wake guidance.
+Production-grade, zero-leak, auto-recovering stream engine with exhaustive diagnostics.
 """
 
 import ctypes
@@ -83,7 +83,7 @@ class NanoPiViewerApp:
         logger.info("Initializing NanoPiViewerApp...")
 
         self.config = config.load_config()
-        logger.info(f"Loaded config: {json.dumps(self.config)}")
+        logger.info(f"Loaded configuration: {json.dumps(self.config)}")
 
         self.root.title(f"NanoPi 2 - Live Screen HD ({self.config.get('device_ip')})")
         self.root.geometry(f"{self.config.get('window_width', 1020)}x{self.config.get('window_height', 660)}")
@@ -93,7 +93,7 @@ class NanoPiViewerApp:
         self.adb_path = get_asset_path("adb.exe")
         self.minicap_bin = get_asset_path("minicap")
         self.minicap_so = get_asset_path("minicap.so")
-        logger.info(f"Paths: adb={self.adb_path}, minicap={self.minicap_bin}, minicap.so={self.minicap_so}")
+        logger.info(f"Binary paths: adb='{self.adb_path}', minicap='{self.minicap_bin}', minicap.so='{self.minicap_so}'")
 
         self.device_serial = f"{self.config.get('device_ip')}:{self.config.get('adb_port', 5555)}"
         self.minicap_port = self.config.get("minicap_port", 1717)
@@ -116,7 +116,7 @@ class NanoPiViewerApp:
         self.tk_img = None
         self.last_frame_time = time.time()
         self.fps = 0.0
-        self.is_streaming = False
+        self.has_active_stream = False
 
         self.input_pipe = None
 
@@ -150,45 +150,21 @@ class NanoPiViewerApp:
         self.status_lbl.pack(side=tk.RIGHT, padx=10)
 
         # Image display container
-        self.display_frame = tk.Frame(self.root, bg="#181818")
+        self.display_frame = tk.Frame(self.root, bg="#121212")
         self.display_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Guidance Frame for sleep/offline mode
-        self.guidance_frame = tk.Frame(self.display_frame, bg="#1e1e1e", padx=25, pady=20, relief=tk.GROOVE, bd=1)
-        self.guidance_title = tk.Label(self.guidance_frame, text="💤 Device May Be Asleep or Disconnected", font=("Segoe UI", 14, "bold"), fg="#FFA726", bg="#1e1e1e")
-        self.guidance_title.pack(pady=(0, 10))
-
-        self.guidance_text = tk.Label(
-            self.guidance_frame,
-            text=f"Target: {self.config.get('device_ip')}:{self.config.get('adb_port', 5555)}\n\n"
-                 "• Press the physical POWER button on the NanoPi 2 board to wake Wi-Fi.\n"
-                 "• Ensure the device is connected to the same network.\n"
-                 "• NanoPiViewer will automatically resume live streaming once detected.",
-            font=("Segoe UI", 10), fg="#CCCCCC", bg="#1e1e1e", justify=tk.LEFT
+        # Always-packed single display label
+        offline_msg = (
+            f"🔍 Searching for NanoPi 2 ({self.device_serial})...\n\n"
+            "• If the device is asleep, press the physical POWER button on the board.\n"
+            "• Ensure your network cable or Wi-Fi is connected.\n"
+            "• Live screen streaming will resume automatically when detected."
         )
-        self.guidance_text.pack(pady=5)
-
-        action_btn_frame = tk.Frame(self.guidance_frame, bg="#1e1e1e")
-        action_btn_frame.pack(pady=15)
-
-        tk.Button(
-            action_btn_frame, text="⚡ Send Serial Wake Pulse (COM3)",
-            bg="#2196F3", fg="white", activebackground="#1976D2", activeforeground="white",
-            relief=tk.FLAT, padx=12, pady=6, cursor="hand2", font=("Segoe UI", 9, "bold"),
-            command=self._send_serial_wake
-        ).pack(side=tk.LEFT, padx=6)
-
-        tk.Button(
-            action_btn_frame, text="🔄 Try Reconnecting Now",
-            bg="#4CAF50", fg="white", activebackground="#388E3C", activeforeground="white",
-            relief=tk.FLAT, padx=12, pady=6, cursor="hand2", font=("Segoe UI", 9, "bold"),
-            command=self._restart_stream
-        ).pack(side=tk.LEFT, padx=6)
-
-        self.guidance_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-
-        # Image display label (hidden when offline)
-        self.display_label = tk.Label(self.display_frame, bg="#000000")
+        self.display_label = tk.Label(
+            self.display_frame, bg="#121212", fg="#A0A0A0",
+            text=offline_msg, font=("Segoe UI", 11), justify=tk.CENTER
+        )
+        self.display_label.pack(fill=tk.BOTH, expand=True)
 
         # Mouse & Keyboard bindings
         self.display_label.bind("<ButtonPress-1>", self._on_mouse_down)
@@ -197,40 +173,6 @@ class NanoPiViewerApp:
         self.display_label.bind("<Button-2>", lambda e: self.send_key(3))
         self.root.bind("<Key>", self._on_key)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _show_guidance(self, show=True, title=None, subtitle=None):
-        if show:
-            if title:
-                self.guidance_title.config(text=title)
-            if subtitle:
-                self.guidance_text.config(text=subtitle)
-            self.display_label.pack_forget()
-            self.guidance_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-            self.is_streaming = False
-        else:
-            self.guidance_frame.place_forget()
-            self.display_label.pack(expand=True)
-            self.is_streaming = True
-
-    def _send_serial_wake(self):
-        logger.info("Attempting serial wake pulse via COM3...")
-        self._set_status("Sending COM3 Serial wake pulse...", fg="#2196F3")
-        try:
-            if SERIAL_AVAILABLE:
-                s = serial.Serial('COM3', 115200, timeout=1.0)
-                s.write(b"\nsu\ninput keyevent 82\nsvc power stayon true\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\n")
-                time.sleep(0.3)
-                s.close()
-                logger.info("Serial pulse sent via pyserial successfully.")
-            else:
-                ps_script = "$p = New-Object System.IO.Ports.SerialPort('COM3',115200); $p.Open(); $p.WriteLine('`r`nsu`r`ninput keyevent 82`r`n'); $p.Close()"
-                subprocess.run(["powershell", "-Command", ps_script], creationflags=CREATE_NO_WINDOW)
-                logger.info("Serial pulse sent via PowerShell successfully.")
-
-            self.root.after(1000, self._restart_stream)
-        except Exception as e:
-            logger.warning(f"Serial wake notice: {e}")
-            self._set_status("Serial port unavailable. Press board Power button.", fg="#FFA726")
 
     def _open_log_file(self):
         try:
@@ -253,6 +195,7 @@ class NanoPiViewerApp:
         logger.info("Restart stream requested by user.")
         self._set_status("Reconnecting...", fg="#FFA726")
         self.frame_count = 0
+        self.has_active_stream = False
         self._start_capture_thread()
 
     def _set_status(self, text, fg="#4CAF50"):
@@ -262,7 +205,7 @@ class NanoPiViewerApp:
             pass
 
     def _start_threads(self):
-        logger.info("Starting background worker threads...")
+        logger.info("Starting worker threads...")
         self.input_thread = threading.Thread(target=self._persistent_input_worker, daemon=True, name="InputWorker")
         self.input_thread.start()
 
@@ -272,10 +215,10 @@ class NanoPiViewerApp:
         self._start_capture_thread()
 
     def _keepalive_worker(self):
-        """Sends stay-awake policy every 30 seconds when connected to prevent Wi-Fi sleep."""
+        """Sends stay-awake policy every 25 seconds when connected to prevent Wi-Fi sleep."""
         while self.running:
-            time.sleep(30)
-            if self.is_streaming:
+            time.sleep(25)
+            if self.has_active_stream:
                 try:
                     self._dispatch_command("svc power stayon true")
                     self._dispatch_command("settings put global wifi_sleep_policy 2")
@@ -294,6 +237,17 @@ class NanoPiViewerApp:
         self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
         self.capture_thread.start()
 
+    def _fast_probe_tcp(self, ip, port, timeout=0.8):
+        """Probe TCP port fast to avoid blocking in slow adb connect calls."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            res = s.connect_ex((ip, port))
+            s.close()
+            return res == 0
+        except Exception:
+            return False
+
     def _is_device_ready(self):
         try:
             p = subprocess.run(
@@ -308,13 +262,26 @@ class NanoPiViewerApp:
         return False
 
     def _connect_adb(self):
+        ip = self.config.get("device_ip", "192.168.1.113")
+        port = int(self.config.get("adb_port", 5555))
+
+        logger.info(f"[Probe] Fast probing {ip}:{port} TCP port...")
+        if not self._fast_probe_tcp(ip, port, timeout=0.8):
+            logger.info(f"[Probe Failed] Host {ip}:{port} not responding (device likely asleep/offline).")
+            return False
+
+        logger.info(f"[Probe OK] Host {ip}:{port} reachable. Running: adb connect {self.device_serial}...")
+        t0 = time.time()
         try:
-            subprocess.run(
+            p = subprocess.run(
                 [self.adb_path, "connect", self.device_serial],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.5, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=3.0, creationflags=CREATE_NO_WINDOW
             )
-        except Exception:
-            pass
+            logger.info(f"[Connect Done] Took {time.time()-t0:.3f}s. Output: {p.stdout.strip()} {p.stderr.strip()}")
+        except Exception as ex:
+            logger.warning(f"[Connect Timeout/Error]: {ex}")
+            return False
+
         return self._is_device_ready()
 
     def _recv_all(self, sock, n):
@@ -337,19 +304,20 @@ class NanoPiViewerApp:
             s = None
             minicap_proc = None
             try:
-                # Step 0: Check if device is awake and connected
+                # Step 0: Ensure Device is Awake & Connected
                 if not self._is_device_ready():
-                    self.root.after(0, lambda: self._show_guidance(
-                        True,
-                        "💤 Device Asleep or Offline",
-                        f"Target: {self.device_serial}\n\n"
-                        "• Press the physical POWER button on NanoPi 2 to wake.\n"
-                        "• Ensure the device is connected to the network.\n"
-                        "• Stream will automatically start when device is awake."
-                    ))
                     self._set_status(f"Searching for {self.device_serial}...", fg="#FFA726")
                     if not self._connect_adb():
-                        time.sleep(2.0)
+                        # Update display label with helpful instructions
+                        if not self.has_active_stream:
+                            offline_msg = (
+                                f"💤 NanoPi 2 is Asleep or Offline ({self.device_serial})\n\n"
+                                "• Press the physical POWER button on the board to wake Wi-Fi.\n"
+                                "• Or click [⚡ Power / Wake] in the top toolbar.\n"
+                                "• Stream will automatically start as soon as the device is awake."
+                            )
+                            self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
+                        time.sleep(1.5)
                         continue
 
                 self._set_status("Initializing stream...", fg="#4CAF50")
@@ -381,7 +349,7 @@ class NanoPiViewerApp:
                     creationflags=CREATE_NO_WINDOW
                 )
 
-                # Give minicap 0.4s to initialize
+                # Give minicap 0.4s to initialize abstract socket
                 time.sleep(0.4)
 
                 # Wake screen
@@ -421,9 +389,6 @@ class NanoPiViewerApp:
                 s.settimeout(10.0)
                 logger.info("[Step 4] Entering continuous streaming loop...")
 
-                # Show live video frame
-                self.root.after(0, lambda: self._show_guidance(False))
-
                 first_frame = True
                 while self.running and not self.stream_stop_event.is_set():
                     t_frame_start = time.time()
@@ -446,6 +411,7 @@ class NanoPiViewerApp:
                     if first_frame:
                         logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
                         first_frame = False
+                        self.has_active_stream = True
 
                     try:
                         old_item = self.frame_queue.get_nowait()
@@ -463,6 +429,7 @@ class NanoPiViewerApp:
 
             except Exception as e:
                 logger.exception(f"Stream worker exception: {e}")
+                self.has_active_stream = False
                 if s:
                     try: s.close()
                     except Exception: pass
@@ -572,15 +539,27 @@ class NanoPiViewerApp:
         except queue.Empty:
             pass
         except Exception as ex:
-            self._set_status(f"Error: {ex}", fg="#FF5252")
+            self._set_status(f"Render Error: {ex}", fg="#FF5252")
 
         self.root.after(16, self._update_loop)
 
     def _wake_and_unlock(self):
-        logger.info("Sending wake and unlock sequence via pipe...")
+        logger.info("Sending wake and unlock sequence via pipe and serial...")
         self._dispatch_command("input keyevent 26")
         self._dispatch_command("input keyevent 82")
         self._dispatch_command("input swipe 640 600 640 100 200")
+        self._dispatch_command("svc power stayon true")
+
+        # Also send pulse over COM3 if available
+        if SERIAL_AVAILABLE:
+            try:
+                s = serial.Serial('COM3', 115200, timeout=0.5)
+                s.write(b"\nsu\ninput keyevent 82\nsvc power stayon true\n")
+                time.sleep(0.1)
+                s.close()
+                logger.info("Serial wake pulse sent on COM3.")
+            except Exception:
+                pass
 
     def _on_mouse_down(self, event):
         self.drag_start = (event.x, event.y, time.time())
