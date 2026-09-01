@@ -421,16 +421,17 @@ class NanoPiViewerApp:
                 self.current_minicap_proc = None
 
     def _input_worker(self):
-        """Safe input worker dispatching one-shot lightweight commands."""
+        """Safe input worker dispatching non-blocking lightweight commands."""
         logger.info("Starting safe ADB input worker...")
         
         while self.running:
             try:
                 cmd_line = self.input_queue.get(timeout=0.5)
                 if self.has_active_stream or self._is_device_ready():
-                    subprocess.run(
+                    subprocess.Popen(
                         [self.adb_path, "-s", self.device_serial, "shell", cmd_line],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW
                     )
                 self.input_queue.task_done()
             except queue.Empty:
