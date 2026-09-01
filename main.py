@@ -1,8 +1,9 @@
 """
 NanoPi 2 - Portable Standalone Android Screen Viewer
-Production-grade, fully optimized, zero-memory-leak, high-performance stream engine.
+Production-grade, zero-leak, instant-connect stream engine.
 """
 
+import ctypes
 import gc
 import json
 import logging
@@ -99,6 +100,10 @@ class NanoPiViewerApp:
         self.frame_queue = queue.Queue(maxsize=1)
         self.input_queue = queue.Queue(maxsize=50)
         self.running = True
+        self.stream_stop_event = threading.Event()
+        self.capture_thread = None
+        self.input_thread = None
+        
         self.drag_start = None
         self.frame_count = 0
         self.tk_img = None
@@ -175,18 +180,61 @@ class NanoPiViewerApp:
         self._start_capture_thread()
 
     def _start_threads(self):
-        logger.info("Starting background worker threads...")
-        self._start_capture_thread()
+        logger.info("Starting initialization sequence...")
+        threading.Thread(target=self._init_and_start_workers, daemon=True, name="InitThread").start()
+
+    def _init_and_start_workers(self):
+        t0 = time.time()
+        logger.info(f"[Init] Connecting ADB to {self.device_serial}...")
+        try:
+            subprocess.run(
+                [self.adb_path, "connect", self.device_serial],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3.0, creationflags=CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
+        logger.info(f"[Init] ADB connected in {time.time()-t0:.3f}s")
+
+        # Start input pipe
         self.input_thread = threading.Thread(target=self._persistent_input_worker, daemon=True, name="InputWorker")
         self.input_thread.start()
 
+        # Start stream worker
+        self._start_capture_thread()
+
     def _start_capture_thread(self):
+        self.stream_stop_event.set()
+        if self.capture_thread and self.capture_thread.is_alive():
+            try:
+                self.capture_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+        self.stream_stop_event.clear()
         self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
         self.capture_thread.start()
 
+    def _kill_remote_minicap(self):
+        try:
+            p = subprocess.run(
+                [self.adb_path, "-s", self.device_serial, "shell", "ps"],
+                capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
+            )
+            for line in p.stdout.splitlines():
+                if "minicap" in line:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        logger.info(f"Killing stale remote minicap PID={parts[1]}")
+                        subprocess.run(
+                            [self.adb_path, "-s", self.device_serial, "shell", f"kill -9 {parts[1]}"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
+                        )
+        except Exception as e:
+            logger.debug(f"Kill remote minicap warning: {e}")
+
     def _recv_all(self, sock, n):
         data = bytearray()
-        while len(data) < n and self.running:
+        while len(data) < n and self.running and not self.stream_stop_event.is_set():
             try:
                 chunk = sock.recv(n - len(data))
                 if not chunk:
@@ -200,95 +248,67 @@ class NanoPiViewerApp:
     def _logged_stream_worker(self):
         logger.info(f"Stream worker started. Target: {self.device_serial}, port: {self.minicap_port}")
         
-        while self.running:
+        while self.running and not self.stream_stop_event.is_set():
             s = None
             minicap_proc = None
             try:
-                # Step 1: ADB Connect
+                # Step 1: Forward port with unique abstract socket name
+                sock_name = f"mc_{int(time.time()) % 100000}"
                 t0 = time.time()
-                logger.info(f"[Step 1] Connecting ADB to {self.device_serial}...")
-                adb_res = subprocess.run(
-                    [self.adb_path, "connect", self.device_serial],
-                    capture_output=True, text=True, timeout=3.0, creationflags=CREATE_NO_WINDOW
+                logger.info(f"[Step 1] Forwarding port tcp:{self.minicap_port} -> localabstract:{sock_name}...")
+                subprocess.run(
+                    [self.adb_path, "-s", self.device_serial, "forward", f"tcp:{self.minicap_port}", f"localabstract:{sock_name}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW
                 )
-                logger.info(f"[Step 1 Done] ADB connect took {time.time()-t0:.3f}s. Output: {adb_res.stdout.strip()}")
+                logger.info(f"[Step 1 Done] ADB forward took {time.time()-t0:.3f}s")
 
-                # Step 2: ADB Forward
-                t0 = time.time()
-                logger.info(f"[Step 2] Forwarding port tcp:{self.minicap_port} -> localabstract:minicap...")
-                fwd_res = subprocess.run(
-                    [self.adb_path, "-s", self.device_serial, "forward", f"tcp:{self.minicap_port}", "localabstract:minicap"],
-                    capture_output=True, text=True, timeout=2.0, creationflags=CREATE_NO_WINDOW
-                )
-                logger.info(f"[Step 2 Done] ADB forward took {time.time()-t0:.3f}s. Output: {fwd_res.stdout.strip()}")
-
-                # Step 3: Spawn minicap on device with configurable JPEG quality
+                # Step 2: Spawn minicap with unique socket name
                 nat_res = self.config.get("native_resolution", "1280x720")
                 str_res = self.config.get("stream_resolution", "1280x720")
                 quality = self.config.get("jpeg_quality", 60)
 
                 minicap_cmd = [
                     self.adb_path, "-s", self.device_serial, "shell",
-                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -P {nat_res}@{str_res}/0 -Q {quality} -S"
+                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P {nat_res}@{str_res}/0 -Q {quality} -S"
                 ]
-                logger.info(f"[Step 3] Spawning minicap process (Quality={quality}): {' '.join(minicap_cmd)}")
-                t0 = time.time()
+                logger.info(f"[Step 2] Spawning minicap (Quality={quality}, Socket={sock_name}): {' '.join(minicap_cmd)}")
                 minicap_proc = subprocess.Popen(
                     minicap_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     creationflags=CREATE_NO_WINDOW
                 )
-                logger.info(f"[Step 3 Done] Minicap process spawned in {time.time()-t0:.3f}s")
 
-                # Step 3b: Send wake trigger via fast pipe or process
+                # Give minicap 0.4s to initialize abstract socket
+                time.sleep(0.4)
+
+                # Wake screen
                 self._dispatch_command("input keyevent 82")
 
-                # Step 4: Socket Handshake with TCP_NODELAY
-                logger.info(f"[Step 4] Starting TCP socket handshake on 127.0.0.1:{self.minicap_port}...")
-                t_socket_start = time.time()
-                banner = None
+                # Step 3: Socket Handshake
+                logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                s.settimeout(2.5)
 
-                for attempt in range(1, 51):
-                    if not self.running: break
-                    time.sleep(0.05)
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-                        s.settimeout(0.6)
-                        s.connect(("127.0.0.1", self.minicap_port))
-                        banner = self._recv_all(s, 24)
-                        if banner and len(banner) == 24:
-                            logger.info(f"[Step 4 Handshake OK] Attempt #{attempt} succeeded in {time.time()-t_socket_start:.3f}s!")
-                            break
-                        else:
-                            s.close()
-                            s = None
-                    except Exception as ex:
-                        if s:
-                            s.close()
-                            s = None
-                        if attempt % 10 == 0:
-                            logger.debug(f"[Step 4] Handshake attempt #{attempt} waiting: {ex}")
+                s.connect(("127.0.0.1", self.minicap_port))
+                banner = self._recv_all(s, 24)
 
-                if not s or not banner or len(banner) < 24:
-                    logger.warning(f"[Step 4 Failed] Socket handshake failed after {time.time()-t_socket_start:.3f}s.")
+                if not banner or len(banner) < 24:
+                    logger.warning(f"[Step 3 Failed] Incomplete banner. Retrying...")
+                    s.close()
                     if minicap_proc:
                         try: minicap_proc.terminate()
                         except Exception: pass
                     time.sleep(1.0)
                     continue
 
-                # Parse banner
-                version = banner[0]
                 rw = struct.unpack("<I", banner[6:10])[0]
                 rh = struct.unpack("<I", banner[10:14])[0]
                 vw = struct.unpack("<I", banner[14:18])[0]
                 vh = struct.unpack("<I", banner[18:22])[0]
-                orient = banner[22]
-                quirks = banner[23]
-                logger.info(f"[Banner Parsed] v={version}, Real={rw}x{rh}, Virtual={vw}x{vh}, Orient={orient}, Quirks={quirks}")
+                logger.info(f"[Banner Parsed] Real={rw}x{rh}, Virtual={vw}x{vh}")
 
                 self.native_width = rw
                 self.native_height = rh
@@ -296,34 +316,31 @@ class NanoPiViewerApp:
                 self.target_h = vh
 
                 s.settimeout(10.0)
-                logger.info("[Step 5] Entering continuous streaming loop...")
+                logger.info("[Step 4] Entering continuous streaming loop...")
 
                 first_frame = True
-                while self.running:
+                while self.running and not self.stream_stop_event.is_set():
                     t_frame_start = time.time()
                     size_raw = self._recv_all(s, 4)
                     if not size_raw or len(size_raw) < 4:
-                        logger.warning("Failed to read 4-byte frame header. Reconnecting...")
+                        logger.warning("Failed to read frame header. Reconnecting...")
                         break
 
                     frame_size = struct.unpack("<I", size_raw)[0]
                     if frame_size <= 0 or frame_size > 5000000:
-                        logger.warning(f"Invalid frame size: {frame_size}. Reconnecting...")
                         break
 
                     frame_data = self._recv_all(s, frame_size)
                     if not frame_data or len(frame_data) < frame_size:
-                        logger.warning("Incomplete frame payload. Reconnecting...")
                         break
 
                     t_recv = time.time()
                     img = Image.open(BytesIO(frame_data))
 
                     if first_frame:
-                        logger.info(f"🎉 FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
+                        logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
                         first_frame = False
 
-                    # Memory-safe queue replace
                     try:
                         old_item = self.frame_queue.get_nowait()
                         if old_item and old_item[0]:
@@ -339,7 +356,7 @@ class NanoPiViewerApp:
                     except Exception: pass
 
             except Exception as e:
-                logger.exception(f"Unexpected exception in stream worker: {e}")
+                logger.exception(f"Exception in stream worker: {e}")
                 if s:
                     try: s.close()
                     except Exception: pass
@@ -349,7 +366,6 @@ class NanoPiViewerApp:
                 time.sleep(1.0)
 
     def _persistent_input_worker(self):
-        """Ultra-low latency persistent ADB interactive shell pipe (<1ms dispatch)."""
         logger.info("Starting persistent ADB input pipe...")
         
         while self.running:
@@ -421,7 +437,6 @@ class NanoPiViewerApp:
             else:
                 render_img = img
 
-            # Single-handle GDI bitmap update (prevent Windows GDI leak)
             new_tk = ImageTk.PhotoImage(render_img)
             self.display_label.config(image=new_tk, text="")
             self.tk_img = new_tk
@@ -436,7 +451,6 @@ class NanoPiViewerApp:
                 self.fps = 0.9 * self.fps + 0.1 * (1.0 / frame_dt)
             self.last_frame_time = now
 
-            # Periodic memory garbage collection every 200 frames
             if self.frame_count % 200 == 0:
                 gc.collect()
 
@@ -511,15 +525,45 @@ class NanoPiViewerApp:
     def _on_close(self):
         logger.info("Application closing...")
         self.running = False
+        self.stream_stop_event.set()
         if self.input_pipe:
             try:
                 if self.input_pipe.stdin: self.input_pipe.stdin.close()
                 self.input_pipe.terminate()
             except Exception: pass
+        self._kill_remote_minicap()
         self.root.destroy()
 
 
+# Global Windows Mutex for single instance
+MUTEX_HANDLE = None
+
+def acquire_single_instance_mutex():
+    global MUTEX_HANDLE
+    mutex_name = "Global\\NanoPiViewer_SingleInstance_Mutex"
+    MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    if last_error == 183:  # ERROR_ALREADY_EXISTS
+        return False
+    return True
+
+
 def main():
+    if not acquire_single_instance_mutex():
+        logger.warning("Another instance of NanoPiViewer is already running. Exiting.")
+        root = tk.Tk()
+        root.withdraw()
+        tk.messagebox.showinfo("NanoPiViewer", "NanoPiViewer is already running!\nPlease check your taskbar.")
+        root.destroy()
+        return
+
+    # Pre-warm ADB server
+    adb = get_asset_path("adb.exe")
+    try:
+        subprocess.run([adb, "start-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
     root = tk.Tk()
     app = NanoPiViewerApp(root)
     root.mainloop()
