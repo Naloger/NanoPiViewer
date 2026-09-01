@@ -318,8 +318,8 @@ class NanoPiViewerApp:
                 logger.info(f"[Step 2] Spawning native minicap (Quality={quality}): {' '.join(minicap_cmd)}")
                 minicap_proc = subprocess.Popen(
                     minicap_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     creationflags=CREATE_NO_WINDOW
                 )
                 self.current_minicap_proc = minicap_proc
@@ -385,21 +385,18 @@ class NanoPiViewerApp:
                         break
 
                     t_recv = time.time()
-                    img = Image.open(BytesIO(frame_data))
 
                     if first_frame:
-                        logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Res={img.size}, Total time={t_recv - t0:.3f}s")
+                        logger.info(f"[OK] FIRST FRAME RECEIVED! Size={frame_size} bytes, Total time={t_recv - t0:.3f}s")
                         first_frame = False
                         self.has_active_stream = True
 
                     try:
-                        old_item = self.frame_queue.get_nowait()
-                        if old_item and old_item[0]:
-                            old_item[0].close()
+                        self.frame_queue.get_nowait()
                     except queue.Empty:
                         pass
 
-                    self.frame_queue.put((img, len(frame_data), t_recv - t_frame_start))
+                    self.frame_queue.put((frame_data, len(frame_data), t_recv - t_frame_start))
 
                 s.close()
                 if minicap_proc:
@@ -421,16 +418,17 @@ class NanoPiViewerApp:
                 self.current_minicap_proc = None
 
     def _input_worker(self):
-        """Safe input worker dispatching non-blocking lightweight commands."""
+        """Safe input worker dispatching non-blocking lightweight commands with clean process termination."""
         logger.info("Starting safe ADB input worker...")
         
         while self.running:
             try:
                 cmd_line = self.input_queue.get(timeout=0.5)
                 if self.has_active_stream or self._is_device_ready():
-                    subprocess.Popen(
+                    subprocess.run(
                         [self.adb_path, "-s", self.device_serial, "shell", cmd_line],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=1.5,
                         creationflags=CREATE_NO_WINDOW
                     )
                 self.input_queue.task_done()
@@ -450,7 +448,7 @@ class NanoPiViewerApp:
             return
 
         try:
-            img, bytes_len, dt = self.frame_queue.get_nowait()
+            raw_frame, bytes_len, dt = self.frame_queue.get_nowait()
 
             fw = self.display_frame.winfo_width()
             fh = self.display_frame.winfo_height()
@@ -463,19 +461,21 @@ class NanoPiViewerApp:
             nw = max(10, int(self.target_w * scale))
             nh = max(10, int(self.target_h * scale))
 
-            # Hardware bilinear scaling on PC
-            if img.size != (nw, nh):
-                resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
-                img.close()
-                del img
-                render_img = resized
-            else:
-                render_img = img
+            # Decode and scale image with deterministic memory cleanup
+            with BytesIO(raw_frame) as bio:
+                with Image.open(bio) as img:
+                    if img.size != (nw, nh):
+                        render_img = img.resize((nw, nh), Image.Resampling.BILINEAR)
+                    else:
+                        render_img = img.copy()
 
-            new_tk = ImageTk.PhotoImage(render_img)
-            self.display_label.config(image=new_tk, text="")
-            self.tk_img = new_tk
-            
+            # Reuse existing PhotoImage via .paste() to prevent Tk C-memory/GDI handle churn
+            if self.tk_img is None or self.tk_img.width() != nw or self.tk_img.height() != nh:
+                self.tk_img = ImageTk.PhotoImage(render_img)
+                self.display_label.config(image=self.tk_img, text="")
+            else:
+                self.tk_img.paste(render_img)
+
             render_img.close()
             del render_img
 
@@ -486,7 +486,7 @@ class NanoPiViewerApp:
                 self.fps = 0.9 * self.fps + 0.1 * (1.0 / frame_dt)
             self.last_frame_time = now
 
-            if self.frame_count % 200 == 0:
+            if self.frame_count % 300 == 0:
                 gc.collect()
 
             self._set_status(
@@ -571,6 +571,13 @@ class NanoPiViewerApp:
         if self.current_minicap_proc:
             try: self.current_minicap_proc.terminate()
             except Exception: pass
+        try:
+            subprocess.run(
+                [self.adb_path, "-s", self.device_serial, "forward", "--remove", f"tcp:{self.minicap_port}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
         self.root.destroy()
 
 
@@ -583,6 +590,9 @@ def acquire_single_instance_mutex():
     MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
     last_error = ctypes.windll.kernel32.GetLastError()
     if last_error == 183:  # ERROR_ALREADY_EXISTS
+        if MUTEX_HANDLE:
+            ctypes.windll.kernel32.CloseHandle(MUTEX_HANDLE)
+            MUTEX_HANDLE = None
         return False
     return True
 

@@ -139,12 +139,11 @@ class SettingsDialog(tk.Toplevel):
 
         if SERIAL_AVAILABLE:
             try:
-                s = serial.Serial('COM3', 115200, timeout=1.0)
-                cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\nnetcfg eth0 dhcp\n"
-                s.write(cmd)
-                time.sleep(0.5)
-                s.close()
-                success = True
+                with serial.Serial('COM3', 115200, timeout=1.0) as s:
+                    cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\nnetcfg eth0 dhcp\n"
+                    s.write(cmd)
+                    time.sleep(0.5)
+                    success = True
             except Exception:
                 pass
 
