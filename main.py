@@ -1,6 +1,6 @@
 """
 NanoPi 2 - Portable Standalone Android Screen Viewer
-Production-grade, crash-proof, zero-leak stream engine.
+Rock-solid, crash-proof, single-process streaming architecture.
 """
 
 import ctypes
@@ -18,12 +18,6 @@ import time
 import tkinter as tk
 from io import BytesIO
 from PIL import Image, ImageTk
-
-try:
-    import serial
-    SERIAL_AVAILABLE = True
-except ImportError:
-    SERIAL_AVAILABLE = False
 
 import config
 from ui_settings import SettingsDialog
@@ -106,20 +100,19 @@ class NanoPiViewerApp:
         self.frame_queue = queue.Queue(maxsize=1)
         self.input_queue = queue.Queue(maxsize=30)
         self.running = True
-        self.stream_stop_event = threading.Event()
-        self.capture_thread = None
-        self.input_thread = None
+        
+        # State control
+        self.restart_requested = False
+        self.has_active_stream = False
         
         self.drag_start = None
         self.frame_count = 0
         self.tk_img = None
         self.last_frame_time = time.time()
         self.fps = 0.0
-        self.has_active_stream = False
 
         self.current_stream_sock = None
         self.current_minicap_proc = None
-        self.thread_lock = threading.Lock()
 
         self._setup_ui()
         self._start_threads()
@@ -196,7 +189,13 @@ class NanoPiViewerApp:
         self._set_status("Reconnecting...", fg="#FFA726")
         self.frame_count = 0
         self.has_active_stream = False
-        self._start_capture_thread()
+        self.restart_requested = True
+        if self.current_stream_sock:
+            try: self.current_stream_sock.close()
+            except Exception: pass
+        if self.current_minicap_proc:
+            try: self.current_minicap_proc.terminate()
+            except Exception: pass
 
     def _set_status(self, text, fg="#4CAF50"):
         try:
@@ -209,32 +208,8 @@ class NanoPiViewerApp:
         self.input_thread = threading.Thread(target=self._input_worker, daemon=True, name="InputWorker")
         self.input_thread.start()
 
-        self._start_capture_thread()
-
-    def _start_capture_thread(self):
-        with self.thread_lock:
-            self.stream_stop_event.set()
-            
-            # Instantly unblock any active socket or process
-            if self.current_stream_sock:
-                try: self.current_stream_sock.close()
-                except Exception: pass
-                self.current_stream_sock = None
-
-            if self.current_minicap_proc:
-                try: self.current_minicap_proc.terminate()
-                except Exception: pass
-                self.current_minicap_proc = None
-
-            if self.capture_thread and self.capture_thread.is_alive() and threading.current_thread() != self.capture_thread:
-                try:
-                    self.capture_thread.join(timeout=0.3)
-                except Exception:
-                    pass
-
-            self.stream_stop_event.clear()
-            self.capture_thread = threading.Thread(target=self._logged_stream_worker, daemon=True, name="StreamWorker")
-            self.capture_thread.start()
+        self.capture_thread = threading.Thread(target=self._single_stream_loop, daemon=True, name="StreamWorker")
+        self.capture_thread.start()
 
     def _is_device_ready(self):
         try:
@@ -274,7 +249,7 @@ class NanoPiViewerApp:
 
     def _recv_all(self, sock, n):
         data = bytearray()
-        while len(data) < n and self.running and not self.stream_stop_event.is_set():
+        while len(data) < n and self.running and not self.restart_requested:
             try:
                 chunk = sock.recv(n - len(data))
                 if not chunk:
@@ -285,14 +260,17 @@ class NanoPiViewerApp:
                 return None
         return bytes(data)
 
-    def _logged_stream_worker(self):
-        logger.info(f"Stream worker started. Target: {self.device_serial}, port: {self.minicap_port}")
+    def _single_stream_loop(self):
+        """Single, permanent streaming loop that never dies or creates duplicate threads."""
+        logger.info(f"Permanent stream worker started.")
         
-        while self.running and not self.stream_stop_event.is_set():
+        while self.running:
+            self.restart_requested = False
             s = None
             minicap_proc = None
+
             try:
-                # Step 0: Ensure Device is Connected & Awake
+                # Step 0: Ensure Device is Connected
                 if not self._is_device_ready():
                     self._set_status(f"Searching for {self.device_serial}...", fg="#FFA726")
                     if not self._connect_adb():
@@ -301,40 +279,43 @@ class NanoPiViewerApp:
                                 f"💤 NanoPi 2 is Asleep or Offline ({self.device_serial})\n\n"
                                 "• Press the physical POWER button on the board to wake Wi-Fi.\n"
                                 "• Or click [⚡ Wake Screen] in the top toolbar.\n"
-                                "• Stream will automatically start as soon as the device is awake."
+                                "• Screen mirroring will automatically start when the device responds."
                             )
                             self.root.after(0, lambda msg=offline_msg: self.display_label.config(text=msg, image=""))
                         time.sleep(1.5)
                         continue
 
-                if self.stream_stop_event.is_set():
-                    break
+                if self.restart_requested:
+                    continue
 
                 self._set_status("Initializing stream...", fg="#4CAF50")
 
-                # Step 1: Forward port with unique abstract socket name
+                # Step 1: Clean up any stale minicap process on Android
+                subprocess.run(
+                    [self.adb_path, "-s", self.device_serial, "shell", "pkill -9 minicap 2>/dev/null || killall -9 minicap 2>/dev/null"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=CREATE_NO_WINDOW
+                )
+
+                # Step 2: Forward port with unique abstract socket name
                 sock_name = f"mc_{int(time.time()) % 100000}"
                 t0 = time.time()
                 logger.info(f"[Step 1] Forwarding port tcp:{self.minicap_port} -> localabstract:{sock_name}...")
                 subprocess.run(
                     [self.adb_path, "-s", self.device_serial, "forward", f"tcp:{self.minicap_port}", f"localabstract:{sock_name}"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=CREATE_NO_WINDOW
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5, creationflags=CREATE_NO_WINDOW
                 )
                 logger.info(f"[Step 1 Done] ADB forward took {time.time()-t0:.3f}s")
 
-                if self.stream_stop_event.is_set():
-                    break
+                if self.restart_requested:
+                    continue
 
-                # Step 2: Spawn minicap with unique socket name
-                nat_res = self.config.get("native_resolution", "1280x720")
-                str_res = self.config.get("stream_resolution", "1280x720")
+                # Step 3: Spawn minicap natively (Native 1280x720 for zero CPU GPU scaling crash)
                 quality = self.config.get("jpeg_quality", 60)
-
                 minicap_cmd = [
                     self.adb_path, "-s", self.device_serial, "shell",
-                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P {nat_res}@{str_res}/0 -Q {quality} -S"
+                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P 1280x720@1280x720/0 -Q {quality} -S"
                 ]
-                logger.info(f"[Step 2] Spawning minicap (Quality={quality}, Socket={sock_name}): {' '.join(minicap_cmd)}")
+                logger.info(f"[Step 2] Spawning native minicap (Quality={quality}): {' '.join(minicap_cmd)}")
                 minicap_proc = subprocess.Popen(
                     minicap_cmd,
                     stdout=subprocess.PIPE,
@@ -343,17 +324,17 @@ class NanoPiViewerApp:
                 )
                 self.current_minicap_proc = minicap_proc
 
-                # Give minicap 0.4s to initialize abstract socket
+                # Allow minicap 0.4s to initialize abstract socket
                 time.sleep(0.4)
 
-                if self.stream_stop_event.is_set():
-                    break
+                if self.restart_requested:
+                    continue
 
-                # Wake screen gently (KEYCODE_WAKEUP = 224 + KEYCODE_MENU = 82)
+                # Wake screen gently
                 self._dispatch_command("input keyevent 224")
                 self._dispatch_command("input keyevent 82")
 
-                # Step 3: Socket Handshake
+                # Step 4: Socket Handshake
                 logger.info(f"[Step 3] Connecting TCP socket 127.0.0.1:{self.minicap_port}...")
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -388,7 +369,7 @@ class NanoPiViewerApp:
                 logger.info("[Step 4] Entering continuous streaming loop...")
 
                 first_frame = True
-                while self.running and not self.stream_stop_event.is_set():
+                while self.running and not self.restart_requested:
                     t_frame_start = time.time()
                     size_raw = self._recv_all(s, 4)
                     if not size_raw or len(size_raw) < 4:
@@ -481,7 +462,7 @@ class NanoPiViewerApp:
             nw = max(10, int(self.target_w * scale))
             nh = max(10, int(self.target_h * scale))
 
-            # Hardware bilinear scaling
+            # Hardware bilinear scaling on PC
             if img.size != (nw, nh):
                 resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
                 img.close()
@@ -520,7 +501,6 @@ class NanoPiViewerApp:
         self.root.after(16, self._update_loop)
 
     def _wake_screen_safely(self):
-        """Safely wakes the screen and unlocks without touching DTR/RTS reset or killing daemons."""
         logger.info("Executing safe screen wake sequence (KEYCODE_WAKEUP + MENU + SWIPE)...")
         # KEYCODE_WAKEUP = 224 (Turns screen ON only, never off!)
         self._dispatch_command("input keyevent 224")
@@ -583,7 +563,7 @@ class NanoPiViewerApp:
     def _on_close(self):
         logger.info("Application closing...")
         self.running = False
-        self.stream_stop_event.set()
+        self.restart_requested = True
         if self.current_stream_sock:
             try: self.current_stream_sock.close()
             except Exception: pass
