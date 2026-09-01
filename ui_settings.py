@@ -49,7 +49,8 @@ class SettingsDialog(tk.Toplevel):
         top_btn_frame = tk.Frame(preset_frame, bg="#2d2d2d")
         top_btn_frame.pack(fill=tk.X, pady=2)
 
-        tk.Button(top_btn_frame, text="📶 Wi-Fi (192.168.1.113)", command=lambda: self._set_ip("192.168.1.113"), **btn_preset_style).pack(side=tk.LEFT, padx=3)
+        wifi_preset = str(self.cfg.get("wifi_preset_ip", "192.168.1.113"))
+        tk.Button(top_btn_frame, text=f"📶 Wi-Fi ({wifi_preset})", command=lambda: self._set_ip(wifi_preset), **btn_preset_style).pack(side=tk.LEFT, padx=3)
         
         self.eth_setup_btn = tk.Button(
             top_btn_frame, text="🔌 Setup Direct Ethernet", command=self._run_direct_ethernet_setup,
@@ -71,7 +72,7 @@ class SettingsDialog(tk.Toplevel):
 
         tk.Label(conn_frame, text="Device IP:", **lbl_style).grid(row=0, column=0, sticky="w", pady=3)
         self.ip_entry = tk.Entry(conn_frame, **entry_style)
-        self.ip_entry.insert(0, str(self.cfg.get("device_ip", "192.168.1.113")))
+        self.ip_entry.insert(0, str(self.cfg.get("device_ip", "169.254.42.120")))
         self.ip_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=3)
 
         tk.Label(conn_frame, text="ADB Port:", **lbl_style).grid(row=1, column=0, sticky="w", pady=3)
@@ -129,32 +130,55 @@ class SettingsDialog(tk.Toplevel):
         self.ip_entry.delete(0, tk.END)
         self.ip_entry.insert(0, ip_addr)
 
+    def _get_available_serial_ports(self):
+        ports = []
+        if SERIAL_AVAILABLE:
+            try:
+                import serial.tools.list_ports
+                for p in serial.tools.list_ports.comports():
+                    ports.append(p.device)
+            except Exception:
+                pass
+        config_port = self.cfg.get("serial_port", "AUTO")
+        if config_port and config_port != "AUTO" and config_port not in ports:
+            ports.insert(0, config_port)
+        if not ports:
+            ports = ["COM3", "COM1", "COM2", "COM4"]
+        return ports
+
     def _run_direct_ethernet_setup(self):
         self.eth_setup_btn.config(text="Configuring...", state=tk.DISABLED)
         threading.Thread(target=self._direct_ethernet_worker, daemon=True).start()
 
     def _direct_ethernet_worker(self):
-        target_ip = "169.254.42.120"
+        target_ip = str(self.cfg.get("direct_ethernet_ip", "169.254.42.120"))
+        target_port = int(self.cfg.get("adb_port", 5555))
+        baud_rate = int(self.cfg.get("serial_baud", 115200))
         success = False
+        connected_port = None
 
         if SERIAL_AVAILABLE:
-            try:
-                with serial.Serial('COM3', 115200, timeout=1.0) as s:
-                    cmd = (
-                        b"\nsu\nsetenforce 0\n"
-                        b"ifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\n"
-                        b"echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
-                        b"echo 0 > /proc/sys/net/ipv4/conf/eth0/rp_filter\n"
-                        b"ip rule add from 169.254.0.0/16 table main pref 1000 2>/dev/null\n"
-                        b"ip rule add to 169.254.0.0/16 table main pref 1001 2>/dev/null\n"
-                        b"setprop service.adb.tcp.port 5555\n"
-                        b"start adbd\n"
-                    )
-                    s.write(cmd)
-                    time.sleep(0.5)
-                    success = True
-            except Exception:
-                pass
+            candidate_ports = self._get_available_serial_ports()
+            for port in candidate_ports:
+                try:
+                    with serial.Serial(port, baud_rate, timeout=1.0) as s:
+                        cmd = (
+                            f"\nsu\nsetenforce 0\n"
+                            f"ifconfig eth0 {target_ip} netmask 255.255.0.0 up\n"
+                            f"echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
+                            f"echo 0 > /proc/sys/net/ipv4/conf/eth0/rp_filter\n"
+                            f"ip rule add from 169.254.0.0/16 table main pref 1000 2>/dev/null\n"
+                            f"ip rule add to 169.254.0.0/16 table main pref 1001 2>/dev/null\n"
+                            f"setprop service.adb.tcp.port {target_port}\n"
+                            f"start adbd\n"
+                        ).encode("utf-8")
+                        s.write(cmd)
+                        time.sleep(0.5)
+                        success = True
+                        connected_port = port
+                        break
+                except Exception:
+                    continue
 
         def update_ui():
             self.eth_setup_btn.config(text="🔌 Setup Direct Ethernet", state=tk.NORMAL)
@@ -162,9 +186,9 @@ class SettingsDialog(tk.Toplevel):
             if success:
                 messagebox.showinfo(
                     "Direct Ethernet Configured",
-                    f"Direct Ethernet IP assigned ({target_ip})!\n\n"
-                    "• Board eth0 is UP (169.254.42.120 / 255.255.0.0)\n"
-                    "• ADB TCP port 5555 enabled.\n\n"
+                    f"Direct Ethernet IP assigned ({target_ip}) via {connected_port}!\n\n"
+                    f"• Board eth0 is UP ({target_ip} / 255.255.0.0)\n"
+                    f"• ADB TCP port {target_port} enabled.\n\n"
                     "Click [Save & Reconnect] to start streaming over Ethernet cable."
                 )
             else:
@@ -176,12 +200,29 @@ class SettingsDialog(tk.Toplevel):
 
         self.after(0, update_ui)
 
+    def _get_local_subnets(self):
+        subnets = set()
+        try:
+            hostname = socket.gethostname()
+            for ip in socket.gethostbyname_ex(hostname)[2]:
+                if not ip.startswith("127.") and not ip.startswith("169.254."):
+                    parts = ip.split(".")
+                    if len(parts) == 4:
+                        subnets.add(".".join(parts[:3]))
+        except Exception:
+            pass
+        if not subnets:
+            subnets.add("192.168.1")
+            subnets.add("192.168.0")
+        return list(subnets)
+
     def _run_auto_detect(self):
         self.auto_btn.config(text="Scanning...", state=tk.DISABLED)
         threading.Thread(target=self._auto_detect_worker, daemon=True).start()
 
     def _auto_detect_worker(self):
         detected_ip = None
+        target_port = int(self.cfg.get("adb_port", 5555))
 
         # 1. Check existing ADB attached devices
         try:
@@ -195,18 +236,32 @@ class SettingsDialog(tk.Toplevel):
         except Exception:
             pass
 
-        # 2. Parallel Fast Socket Scan
+        # 2. Parallel Dynamic Subnet Scan
         if not detected_ip:
-            candidates = ["192.168.1.113", "169.254.42.120"] + [f"192.168.1.{i}" for i in range(100, 140) if f"192.168.1.{i}" != "192.168.1.113"]
+            candidates = [
+                str(self.cfg.get("device_ip", "169.254.42.120")),
+                str(self.cfg.get("direct_ethernet_ip", "169.254.42.120")),
+                str(self.cfg.get("wifi_preset_ip", "192.168.1.113"))
+            ]
             
-            def check_ip(ip):
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.35)
-                res = s.connect_ex((ip, 5555))
-                s.close()
-                return ip if res == 0 else None
+            subnets = self._get_local_subnets()
+            for subnet in subnets:
+                for i in range(1, 255):
+                    ip_str = f"{subnet}.{i}"
+                    if ip_str not in candidates:
+                        candidates.append(ip_str)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            def check_ip(ip):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.25)
+                    res = s.connect_ex((ip, target_port))
+                    s.close()
+                    return ip if res == 0 else None
+                except Exception:
+                    return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
                 results = list(executor.map(check_ip, candidates))
                 for ip in results:
                     if ip:
@@ -218,9 +273,9 @@ class SettingsDialog(tk.Toplevel):
             self.auto_btn.config(text="🔍 Auto-Detect", state=tk.NORMAL)
             if detected_ip:
                 self._set_ip(detected_ip)
-                messagebox.showinfo("Auto-Detect Success", f"Found active NanoPi 2 at:\n{detected_ip}")
+                messagebox.showinfo("Auto-Detect Success", f"Found active device at:\n{detected_ip}:{target_port}")
             else:
-                messagebox.showwarning("Auto-Detect", "No active NanoPi 2 found on port 5555.\n\nTip: Press the physical POWER button on the board or select a preset.")
+                messagebox.showwarning("Auto-Detect", f"No active device found on port {target_port}.\n\nTip: Press the physical POWER button on the board or select a preset.")
 
         self.after(0, update_ui)
 

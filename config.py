@@ -7,9 +7,13 @@ import os
 import sys
 
 DEFAULT_CONFIG = {
-    "device_ip": "192.168.1.113",
+    "device_ip": "169.254.42.120",
     "adb_port": 5555,
     "minicap_port": 1717,
+    "direct_ethernet_ip": "169.254.42.120",
+    "wifi_preset_ip": "192.168.1.113",
+    "serial_port": "AUTO",
+    "serial_baud": 115200,
     "native_resolution": "1280x720",
     "stream_resolution": "1280x720",
     "jpeg_quality": 60,

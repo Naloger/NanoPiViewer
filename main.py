@@ -62,12 +62,11 @@ def get_asset_path(filename):
         if os.path.exists(direct):
             return direct
 
-    global_tool = os.path.join(r"C:\Users\Asus\.gemini\tools\platform-tools", filename)
-    if os.path.exists(global_tool):
-        return global_tool
-    global_mc = os.path.join(r"C:\Users\Asus\.gemini\tools\minicap", filename)
-    if os.path.exists(global_mc):
-        return global_mc
+    # Dynamic system PATH resolution fallback
+    import shutil
+    which_path = shutil.which(filename)
+    if which_path and os.path.exists(which_path):
+        return which_path
 
     return filename
 
@@ -217,11 +216,12 @@ class NanoPiViewerApp:
                 [self.adb_path, "devices"],
                 capture_output=True, text=True, timeout=1.5, creationflags=CREATE_NO_WINDOW
             )
+            target_adb_port = self.config.get("adb_port", 5555)
             for line in p.stdout.splitlines():
                 if self.device_serial in line and "\tdevice" in line:
                     return True
-                # Auto-detect if another device is ready on 5555
-                if "\tdevice" in line and ":5555" in line:
+                # Auto-detect if another device is ready on configured port
+                if "\tdevice" in line and f":{target_adb_port}" in line:
                     other_serial = line.split("\t")[0].strip()
                     if other_serial != self.device_serial:
                         logger.info(f"[Auto-Switch] Switching to online device {other_serial}")
@@ -310,13 +310,15 @@ class NanoPiViewerApp:
                 if self.restart_requested:
                     continue
 
-                # Step 3: Spawn minicap natively (Native 1280x720 for zero CPU GPU scaling crash)
+                # Step 3: Spawn minicap natively using configured resolutions
                 quality = self.config.get("jpeg_quality", 60)
+                native_res = self.config.get("native_resolution", "1280x720")
+                stream_res = self.config.get("stream_resolution", native_res)
                 minicap_cmd = [
                     self.adb_path, "-s", self.device_serial, "shell",
-                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P 1280x720@1280x720/0 -Q {quality} -S"
+                    f"LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap -n {sock_name} -P {native_res}@{stream_res}/0 -Q {quality} -S"
                 ]
-                logger.info(f"[Step 2] Spawning native minicap (Quality={quality}): {' '.join(minicap_cmd)}")
+                logger.info(f"[Step 2] Spawning native minicap (Quality={quality}, Res={native_res}@{stream_res}): {' '.join(minicap_cmd)}")
                 minicap_proc = subprocess.Popen(
                     minicap_cmd,
                     stdout=subprocess.DEVNULL,
