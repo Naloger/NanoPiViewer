@@ -140,7 +140,16 @@ class SettingsDialog(tk.Toplevel):
         if SERIAL_AVAILABLE:
             try:
                 with serial.Serial('COM3', 115200, timeout=1.0) as s:
-                    cmd = b"\nsu\nifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\nsetprop service.adb.tcp.port 5555\nstop adbd; start adbd\n"
+                    cmd = (
+                        b"\nsu\nsetenforce 0\n"
+                        b"ifconfig eth0 169.254.42.120 netmask 255.255.0.0 up\n"
+                        b"echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
+                        b"echo 0 > /proc/sys/net/ipv4/conf/eth0/rp_filter\n"
+                        b"ip rule add from 169.254.0.0/16 table main pref 1000 2>/dev/null\n"
+                        b"ip rule add to 169.254.0.0/16 table main pref 1001 2>/dev/null\n"
+                        b"setprop service.adb.tcp.port 5555\n"
+                        b"start adbd\n"
+                    )
                     s.write(cmd)
                     time.sleep(0.5)
                     success = True
